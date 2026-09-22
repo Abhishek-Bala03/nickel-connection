@@ -1,0 +1,24 @@
+# Run the service locally:
+#   cp .env.example .env          # optional; .env is git-ignored
+#   docker compose up --build
+#   curl http://localhost:8000/health
+services:
+  nickel-connection:
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: nickel-connection:dev
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # This machine only; change the host part to share it on the network.
+      - "127.0.0.1:${NICKEL_PORT:-8000}:8000"
+    # Hardening: read-only root filesystem, no Linux capabilities, no privilege escalation.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

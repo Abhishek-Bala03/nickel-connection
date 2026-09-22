@@ -7,13 +7,35 @@ This layer does not read, change or judge the content.
 
 ## Layout
 
-| Path | What it holds |
-|---|---|
-| `app/` | All service code. The only folder that goes into the image. |
-| `tests/` | Unit tests (pytest). Outside the image. |
-| `docs/` | Design notes. Outside the image. |
-| `Dockerfile`, `pyproject.toml`, `uv.lock` | Build and dependencies. |
-| `.pre-commit-config.yaml`, `sonar-project.properties`, `.github/` | Standards and CI. |
+The same structure as Rockwell's `agentbuilder-be`, with all code under `app/` (the only folder that
+goes into the image):
+
+```
+app/
+  main.py                  FastAPI app: middlewares, error handlers, routers (Rockwell: app.py)
+  conf/application.conf    settings; ${VAR} values come from the environment
+  src/
+    config/                Service settings        from src.config import Service
+    logging/               the service logger      from src.logging import logger
+    error/                 error types and their JSON responses
+    middlewares/           request id, request timing
+    services/              API routes, one router per module, collected in base_router
+    handler/               business logic the routes call
+    models/                request and response models
+    db/                    database access (Postgres)
+    connectors/            source connectors (Nango sources, documents)
+    scheduler/             scheduled pulls
+    utility/               small shared helpers
+tests/                     unit tests (pytest), outside the image
+docs/                      design notes and how-tos, outside the image
+Dockerfile, compose.yaml   image and local run
+pyproject.toml, uv.lock    dependencies
+.pre-commit-config.yaml, sonar-project.properties, .github/    standards and CI
+```
+
+Where new code goes: a route in `src/services/<area>_service.py` (and `base_router`), its logic in
+`src/handler/`, its request and response shapes in `src/models/`, and expected failures raised as one of
+the errors in `src/error` (they become JSON with the right status and the request id).
 
 ## Branches and pull requests
 
@@ -27,6 +49,13 @@ This layer does not read, change or judge the content.
 uv sync                      # Python 3.11 and dependencies
 uv run pre-commit install    # hooks run on every commit
 uv run pytest                # unit tests; coverage must stay at or above 95%
+```
+
+## Run it
+
+```bash
+uv run uvicorn main:app --app-dir app --reload     # http://localhost:8000/health, /docs
+docker compose up --build                           # the same, in the image (see .env.example)
 ```
 
 ## Standards
