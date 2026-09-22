@@ -194,9 +194,10 @@ def test_an_error_after_the_response_started_is_not_answered_twice():
     def stream():
         return StreamingResponse(broken_stream())
 
+    client = TestClient(app)
     # The status line is already out, so the error goes up to the server instead of a second reply.
     with pytest.raises(RuntimeError, match="stream broke"):
-        TestClient(app).get("/stream")
+        client.get("/stream")
 
 
 def test_an_unexpected_error_keeps_the_cors_headers(monkeypatch):
@@ -310,7 +311,8 @@ def test_cors_allows_the_configured_origins_and_shows_them_the_request_id(monkey
     assert preflight.headers["access-control-allow-origin"] == UI
     response = client.get("/health", headers={"Origin": UI})
     exposed = response.headers["access-control-expose-headers"]
-    assert "X-Request-ID" in exposed and "X-Response-Time" in exposed
+    assert "X-Request-ID" in exposed
+    assert "X-Response-Time" in exposed
     other = client.get("/health", headers={"Origin": "http://evil.example"})
     assert "access-control-allow-origin" not in other.headers
 

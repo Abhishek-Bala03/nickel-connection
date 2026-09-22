@@ -14,13 +14,13 @@ health_router = APIRouter(tags=["health"])
 
 
 @health_router.get("/health")
-async def health() -> HealthResponse:  # NOSONAR: async on purpose, see above
+async def health() -> HealthResponse:  # NOSONAR(S7503)
     """The process is up."""
     return HealthResponse(status="ok")
 
 
 @health_router.get("/ready")
-async def ready() -> ReadyResponse:  # NOSONAR: async on purpose, see above
+async def ready() -> ReadyResponse:  # NOSONAR(S7503)
     """The service can take traffic. Dependencies (database, Kafka, Nango) add their checks here."""
     return ReadyResponse(status="ready", checks={})
 
