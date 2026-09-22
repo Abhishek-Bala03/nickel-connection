@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, qa, main]
+  push:
+    branches: [dev, qa, main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SonarQube uses history to tell new code from old
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: Pre-commit (Trivy runs in its own step)
+        run: SKIP=trivy-scan uv run pre-commit run --all-files --show-diff-on-failure
+
+      - name: Unit tests, coverage >= 95%
+        run: uv run pytest
+
+      - name: Trivy (HIGH and CRITICAL dependency vulnerabilities)
+        run: |
+          curl -sSfL https://github.com/aquasecurity/trivy/releases/download/v0.56.2/trivy_0.56.2_Linux-64bit.tar.gz | tar -xz trivy
+          ./trivy fs --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --scanners vuln --skip-dirs .venv .
+
+      - name: SonarQube
+        if: ${{ vars.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}

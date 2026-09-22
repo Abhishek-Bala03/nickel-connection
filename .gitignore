@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+bandit-report.json
+dist/
+build/
+*.egg-info/
+
+# local runtime data (development file store, outbox, receipts)
+.data/
+
+# secrets never live in the repo
+.env

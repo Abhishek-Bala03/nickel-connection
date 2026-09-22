@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+**/__pycache__
+.pytest_cache
+.coverage
+coverage.xml
+htmlcov
+bandit-report.json
+tests
+docs
+.data
+.env

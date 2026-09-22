@@ -1,0 +1,91 @@
+# Team standard: the same hooks and versions as the Rockwell setup (shared by Rahul, 22 Sep 2026).
+# Install once per clone:  uv run pre-commit install
+# Run on everything:       uv run pre-commit run --all-files
+# The Trivy hook needs the trivy binary on PATH (https://trivy.dev). CI runs Trivy in its own step.
+repos:
+  # ── General file hygiene check ─────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace        # Remove trailing whitespace
+      - id: end-of-file-fixer          # Ensure files end with a newline
+      - id: check-yaml                 # Validate YAML syntax
+      - id: check-toml                 # Validate TOML syntax
+      - id: check-json                 # Validate JSON syntax
+      - id: check-merge-conflict       # Catch unresolved merge conflicts
+      - id: check-added-large-files    # Warn on large files (>500 KB)
+        args: ["--maxkb=500"]
+      - id: debug-statements           # Catch leftover debugger calls
+      - id: detect-private-key         # Block accidental key commits
+
+  # ── Code formatting ───────────────────────────────────────────────────────
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        language_version: python3.11   # Enforce Python 3.11 formatting
+
+  # ── Import sorting ────────────────────────────────────────────────────────
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]   # Compatible with Black's style
+
+  # ── Linting ───────────────────────────────────────────────────────────────
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.0
+    hooks:
+      - id: flake8
+        args:
+          - "--max-line-length=88"     # Match Black's default line length
+          - "--extend-ignore=E203,W503,E501,E402,E712,E701"
+
+  # ── Security scanning ─────────────────────────────────────────────────────
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.9
+    hooks:
+      - id: bandit
+        args:
+          - "-c"
+          - "pyproject.toml"
+          - "-f"
+          - "json"                     # JSON output avoids Windows charmap/emoji encoding errors
+          - "-o"
+          - "bandit-report.json"
+          - "--exclude"
+          - "./.git,./.venv"
+        additional_dependencies: ["bandit[toml]"]
+
+  # ── Dependency vulnerability scanning (Trivy) ────────────────────────────
+  - repo: local
+    hooks:
+      - id: trivy-scan
+        name: Trivy Vulnerability Scan
+        language: system
+        entry: trivy fs
+          --severity HIGH,CRITICAL
+          --exit-code 1
+          --ignore-unfixed
+          --scanners vuln
+          --skip-dirs .git
+          --skip-dirs .venv
+          --skip-dirs __pycache__
+          .
+        pass_filenames: false
+        always_run: true
+
+  # ── Upgrade syntax to Python 3.11+ ───────────────────────────────────────
+  - repo: https://github.com/asottile/pyupgrade
+    rev: v3.16.0
+    hooks:
+      - id: pyupgrade
+        args: ["--py311-plus"]         # Enforce modern Python 3.11 syntax
+
+# ── Global settings ───────────────────────────────────────────────────────
+default_language_version:
+  python: python3.11
+
+ci:
+  autofix_commit_msg: "style: auto-fix by pre-commit hooks"
+  autoupdate_commit_msg: "chore: pre-commit autoupdate"
