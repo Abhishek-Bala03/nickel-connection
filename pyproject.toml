@@ -28,6 +28,8 @@ addopts = "--cov=app --cov-branch --cov-report=term-missing --cov-report=xml --c
 
 [tool.coverage.run]
 source = ["app"]
+# Relative paths in coverage.xml, so SonarQube can match them when it scans in Docker or CI.
+relative_files = true
 
 [tool.black]
 line-length = 88

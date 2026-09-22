@@ -32,7 +32,7 @@ uv run pytest                # unit tests; coverage must stay at or above 95%
 ## Standards
 
 - Python 3.11. Black (88 columns), isort (black profile), flake8, bandit, pyupgrade `--py311-plus` and Trivy, via pre-commit.
-- SonarQube on every pull request (`sonar-project.properties`; the server and token come from CI).
+- SonarQube: in CI once a server is configured, and free with Docker until then ([docs/sonarqube.md](docs/sonarqube.md)).
 - Unit tests with coverage at or above 95%.
 - Docker: slim base image, non-root user, only `app/` in the image, no secrets in the image or the repository.
 - No secrets, PHI or real patient data in code, tests, fixtures or logs.
