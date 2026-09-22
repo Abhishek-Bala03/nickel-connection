@@ -54,8 +54,9 @@ uv run pytest                # unit tests; coverage must stay at or above 95%
 ## Run it
 
 ```bash
-uv run uvicorn main:app --app-dir app --reload     # http://localhost:8000/health, /docs
-docker compose up --build                           # the same, in the image (see .env.example)
+cp .env.example .env                                              # once; .env is git-ignored
+uv run --env-file .env uvicorn main:app --app-dir app --reload    # http://localhost:8000/health, /docs
+docker compose up --build                                         # the same, in the image
 ```
 
 ## Standards

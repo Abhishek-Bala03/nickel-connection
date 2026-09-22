@@ -14,12 +14,9 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     useradd --system --no-create-home --uid 999 --shell /bin/false nickel
 
-# Build identity baked into the image, as in Rockwell; /version reports it and an env var overrides it.
-ARG APP_VERSION=unknown
-ENV APP_VERSION=${APP_VERSION}
-
 WORKDIR /app
-# The app root is importable in every process, so `src` and `conf` always resolve (as in Rockwell).
+# `src` is importable from any working directory, e.g. for a one-off command or a scheduler process
+# (uvicorn started from /app would find it anyway).
 ENV PYTHONPATH=/app
 
 # Dependencies first, so they stay cached between code changes. uv is pinned and installed with pip
@@ -31,10 +28,17 @@ RUN pip install --no-cache-dir uv==0.12.0 \
     && pip uninstall -y uv \
     && rm -f /tmp/requirements.txt pyproject.toml uv.lock
 
-COPY --chown=nickel:nickel app/ .
+# Build identity, as in Rockwell: /version reports it and an env var overrides it. It comes after the
+# dependencies, because a changed build argument invalidates the cache of every step below it.
+ARG APP_VERSION=unknown
+ENV APP_VERSION=${APP_VERSION}
+
+# Owned by root (the runtime user can read, not write), so the service cannot rewrite its own code.
+COPY app/ .
 
 USER 999
 EXPOSE 8000
+# No proxy for the local probe, even when HTTP(S)_PROXY is set for vendor calls.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+    CMD ["python", "-c", "import urllib.request as u; u.build_opener(u.ProxyHandler({})).open('http://127.0.0.1:8000/health', timeout=3)"]
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

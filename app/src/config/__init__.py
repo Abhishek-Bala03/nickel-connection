@@ -18,6 +18,7 @@ from src import __version__
 CONF_FILE = Path(__file__).resolve().parents[2] / "conf" / "application.conf"
 _VARIABLE = re.compile(r"\$\{(\w+)\}")
 _LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+_ENVIRONMENTS = ("development", "qa", "production")
 
 
 class EnvInterpolation(BasicInterpolation):
@@ -54,11 +55,18 @@ def load_settings(
 
     log_level = get("LOGGING", "level", "INFO").upper()
     if log_level not in _LOG_LEVELS:
-        raise ValueError(f"log level must be one of {', '.join(_LOG_LEVELS)}")
+        raise ValueError(
+            f"log level {log_level!r} is not one of {', '.join(_LOG_LEVELS)}"
+        )
+    environment = get("SERVICE", "environment", "development").lower()
+    if environment not in _ENVIRONMENTS:
+        raise ValueError(
+            f"environment {environment!r} is not one of {', '.join(_ENVIRONMENTS)}"
+        )
     origins = get("SERVICE", "cors_origins", "")
     return ServiceSettings(
         name=get("SERVICE", "name", "nickel-connection"),
-        environment=get("SERVICE", "environment", "development"),
+        environment=environment,
         # Baked into the image at build time (Dockerfile ARG APP_VERSION), as in Rockwell.
         version=environ.get("APP_VERSION", "").strip() or __version__,
         log_level=log_level,

@@ -1,3 +1,5 @@
+"""Settings come from the shipped conf/application.conf and the environment; the logger writes once."""
+
 import logging
 
 import pytest
@@ -6,26 +8,16 @@ from src import __version__
 from src.config import CONF_FILE, load_settings
 from src.logging import LOG_FORMAT, build_logger
 
-CONF = """
-[SERVICE]
-name = nickel-connection
-environment = ${NICKEL_ENV}
-cors_origins = ${NICKEL_CORS_ORIGINS}
-
-[LOGGING]
-level = ${NICKEL_LOG_LEVEL}
-"""
+EVERY_VARIABLE = {
+    "NICKEL_ENV": "qa",
+    "NICKEL_LOG_LEVEL": "debug",
+    "NICKEL_CORS_ORIGINS": "http://a.example, http://b.example ,",
+    "APP_VERSION": "1.4.0",
+}
 
 
-@pytest.fixture
-def conf(tmp_path):
-    path = tmp_path / "application.conf"
-    path.write_text(CONF, encoding="utf-8")
-    return path
-
-
-def test_defaults_apply_when_variables_are_not_set(conf):
-    settings = load_settings(conf, environ={})
+def test_the_shipped_configuration_falls_back_to_the_defaults():
+    settings = load_settings(CONF_FILE, environ={})
     assert settings.name == "nickel-connection"
     assert settings.environment == "development"
     assert settings.version == __version__
@@ -33,35 +25,46 @@ def test_defaults_apply_when_variables_are_not_set(conf):
     assert settings.cors_origins == ()
 
 
-def test_values_come_from_the_environment(conf):
-    settings = load_settings(
-        conf,
-        environ={
-            "NICKEL_ENV": "qa",
-            "NICKEL_LOG_LEVEL": "debug",
-            "NICKEL_CORS_ORIGINS": "http://a.example, http://b.example ,",
-            "APP_VERSION": "1.4.0",
-        },
-    )
+def test_the_shipped_configuration_reads_every_variable():
+    settings = load_settings(CONF_FILE, environ=EVERY_VARIABLE)
     assert settings.environment == "qa"
     assert settings.log_level == "DEBUG"
     assert settings.cors_origins == ("http://a.example", "http://b.example")
     assert settings.version == "1.4.0"
 
 
-def test_an_unknown_log_level_is_refused(conf):
-    with pytest.raises(ValueError, match="log level"):
-        load_settings(conf, environ={"NICKEL_LOG_LEVEL": "LOUD"})
+def test_values_in_the_file_win_over_the_defaults(tmp_path):
+    conf = tmp_path / "application.conf"
+    conf.write_text("[SERVICE]\nname = other-service\n", encoding="utf-8")
+    assert load_settings(conf, environ={}).name == "other-service"
+
+
+def test_environment_values_are_taken_literally():
+    origins = "http://a.example/%41,http://b.example/${NICKEL_ENV}"
+    settings = load_settings(CONF_FILE, environ={"NICKEL_CORS_ORIGINS": origins})
+    assert settings.cors_origins == tuple(origins.split(","))
+
+
+def test_the_environment_name_is_case_insensitive():
+    assert load_settings(CONF_FILE, environ={"NICKEL_ENV": "QA"}).environment == "qa"
+
+
+@pytest.mark.parametrize(
+    ("variable", "value", "message"),
+    [
+        ("NICKEL_LOG_LEVEL", "LOUD", "log level 'LOUD'"),
+        ("NICKEL_ENV", "staging", "environment 'staging'"),
+    ],
+)
+def test_an_unknown_value_is_refused_by_name(variable, value, message):
+    with pytest.raises(ValueError, match=message):
+        load_settings(CONF_FILE, environ={variable: value})
 
 
 def test_a_missing_configuration_file_is_refused(tmp_path):
     missing = tmp_path / "nope.conf"
     with pytest.raises(FileNotFoundError, match="service configuration"):
         load_settings(missing, environ={})
-
-
-def test_the_shipped_configuration_loads():
-    assert load_settings(CONF_FILE, environ={}).name == "nickel-connection"
 
 
 def test_the_logger_writes_to_stdout_once(capsys):
