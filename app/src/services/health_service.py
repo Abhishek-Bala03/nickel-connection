@@ -8,19 +8,19 @@ from src.models import HealthResponse, ReadyResponse, VersionResponse
 health_router = APIRouter(tags=["health"])
 
 
-@health_router.get("/health", response_model=HealthResponse)
+@health_router.get("/health")
 def health() -> HealthResponse:
     """The process is up."""
     return HealthResponse(status="ok")
 
 
-@health_router.get("/ready", response_model=ReadyResponse)
+@health_router.get("/ready")
 def ready() -> ReadyResponse:
     """The service can take traffic. Dependencies (database, Kafka, Nango) add their checks here."""
     return ReadyResponse(status="ready", checks={})
 
 
-@health_router.get("/version", response_model=VersionResponse)
+@health_router.get("/version")
 def version() -> VersionResponse:
     return VersionResponse(
         name=Service.name, version=Service.version, environment=Service.environment

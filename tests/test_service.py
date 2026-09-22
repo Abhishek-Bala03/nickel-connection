@@ -4,7 +4,7 @@ import dataclasses
 import re
 from unittest import mock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import main
@@ -98,6 +98,44 @@ def test_unexpected_errors_become_a_plain_500_and_are_logged():
     }
     assert "secret internals" not in response.text
     logged.assert_called_once()
+
+
+def test_an_unknown_route_uses_the_error_shape(client):
+    response = client.get("/nope", headers={"X-Request-ID": "r-2"})
+    assert response.status_code == 404
+    assert response.json() == {
+        "error": {"code": "not_found", "message": "Not Found"},
+        "request_id": "r-2",
+    }
+
+
+def test_a_wrong_method_uses_the_error_shape(client):
+    response = client.post("/health")
+    assert response.status_code == 405
+    assert response.json()["error"]["code"] == "method_not_allowed"
+
+
+def test_other_http_errors_get_a_generic_code():
+    response = _app_raising(HTTPException(status_code=418, detail="teapot")).get(
+        "/boom"
+    )
+    assert response.status_code == 418
+    assert response.json()["error"] == {"code": "http_error", "message": "teapot"}
+
+
+def test_an_invalid_request_uses_the_error_shape():
+    app = FastAPI()
+    register_error_handlers(app)
+
+    @app.get("/items/{item_id}")
+    def item(item_id: int):
+        return {"item_id": item_id}
+
+    response = TestClient(app).get("/items/not-a-number")
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "validation_error"
+    assert error["details"][0]["field"] == "path.item_id"
 
 
 def test_cors_is_off_unless_origins_are_configured(client):
