@@ -1,5 +1,6 @@
-"""Source connectors: one sub-package per kind of source.
+"""Source connectors: one sub-package per kind of source. Each reads its manifest and hands raw items to
+the ingest bridge (``src.handler.ingest``); it never reads or judges their content.
 
-Planned: Nango-managed sources (NIK-2209-01) and document sources such as PDFs (NIK-2209-05). A
-connector fetches raw payloads and hands them on unchanged; it never reads or judges their content.
+Here: document sources such as PDFs (``documents``, NIK-2209-05). Planned: Nango-managed sources
+(NIK-2209-01).
 """

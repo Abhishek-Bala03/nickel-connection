@@ -1,0 +1,29 @@
+# Sample lab documents that US reference labs publish on their own sites: real report layouts with
+# sample (not real) patients. The URLs carry no file extension, so every file is taken and the
+# ingest bridge's PDF check decides.
+id: http-lab-sample-reports
+description: Public sample lab documents (Labcorp sample patient report, Quest Metabolic Risk Panel overview)
+stream: documents
+mode: pull
+route: L7
+fetch: http
+auth:
+  type: none
+  vault_path: null
+schedule: on_demand
+formats: [pdf]
+phi: false
+owner: divij
+phase: dev  # a development source: refused in qa and production
+shadow: false  # enabled; true would store and receipt but publish nothing to raw_data
+raw_retention: forever
+contract:
+  baa: null  # public sample documents: no PHI, no business associate
+  dpa: null
+license: Publisher copyright; public sample documents, internal testing only
+include: ["*"]
+max_file_bytes: 52428800
+http:
+  urls:
+    - https://www.labcorp.com/assets/1724
+    - https://www.questdiagnostics.com/content/dam/corporate/unrestricted/documents/Metabolic-Risk-Panel-Overview.pdf

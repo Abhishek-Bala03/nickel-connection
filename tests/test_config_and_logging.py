@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 
 from src import __version__
-from src.config import CONF_FILE, DEFAULT_MAX_FILE_BYTES, load_settings
+from src.config import CONF_FILE, DEFAULT_MAX_FILE_BYTES, MANIFEST_DIR, load_settings
 from src.logging import LOG_FORMAT, build_logger
 
 TENANT = "0192a3b4-0000-7000-8000-000000000001"
@@ -19,6 +19,7 @@ EVERY_VARIABLE = {
     "APP_VERSION": "1.4.0",
     "NICKEL_TENANT_ID": TENANT,
     "NICKEL_MAX_FILE_BYTES": "123",
+    "NICKEL_MANIFEST_DIR": "somewhere/manifests",
     "NICKEL_DATA_DIR": "somewhere",
 }
 
@@ -32,6 +33,7 @@ def test_the_shipped_configuration_falls_back_to_the_defaults():
     assert settings.cors_origins == ()
     assert settings.tenant_id is None
     assert settings.max_file_bytes == DEFAULT_MAX_FILE_BYTES == 100 * 1024 * 1024
+    assert settings.manifest_dir == MANIFEST_DIR
     assert settings.data_dir == Path(".data")
 
 
@@ -43,6 +45,7 @@ def test_the_shipped_configuration_reads_every_variable():
     assert settings.version == "1.4.0"
     assert settings.tenant_id == UUID(TENANT)
     assert settings.max_file_bytes == 123
+    assert settings.manifest_dir == Path("somewhere/manifests")
     assert settings.data_dir == Path("somewhere")
 
 
@@ -90,6 +93,12 @@ def test_a_missing_configuration_file_is_refused(tmp_path):
     missing = tmp_path / "nope.conf"
     with pytest.raises(FileNotFoundError, match="service configuration"):
         load_settings(missing, environ={})
+
+
+def test_source_tokens_are_not_settings():
+    text = CONF_FILE.read_text(encoding="utf-8")
+    assert "${KAGGLE_API_TOKEN}" not in text
+    assert "${HF_TOKEN}" not in text
 
 
 def test_the_logger_writes_to_stdout_once(capsys):

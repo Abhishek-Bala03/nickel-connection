@@ -1,6 +1,7 @@
 import logging
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 import main
@@ -67,6 +68,44 @@ def records():
     logger.addHandler(handler)
     yield captured
     logger.removeHandler(handler)
+
+
+@pytest.fixture
+def pdf_folder(tmp_path, pdf_bytes):
+    """A folder with one PDF, for local-route manifests."""
+    folder = tmp_path / "src"
+    folder.mkdir()
+    (folder / "a.pdf").write_bytes(pdf_bytes)
+    return folder
+
+
+@pytest.fixture
+def manifest_writer(tmp_path):
+    """Writes a valid local-route manifest for a folder and returns the file's path."""
+
+    def write(folder, directory=None, manifest_id="local-docs", **over):
+        data = {
+            "id": manifest_id,
+            "description": "test",
+            "stream": "documents",
+            "mode": "pull",
+            "route": "L7",
+            "fetch": "local",
+            "auth": {"type": "none", "vault_path": None},
+            "phi": False,
+            "owner": "divij",
+            "phase": "prod",  # a clinic's own folder; the phase tests set theirs
+            "shadow": False,
+            "contract": {"baa": None, "dpa": None},
+            "license": "test only",
+            "local": {"path": str(folder)},
+            **over,
+        }
+        path = (directory or tmp_path) / f"{manifest_id}.yaml"
+        path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        return path
+
+    return write
 
 
 @pytest.fixture

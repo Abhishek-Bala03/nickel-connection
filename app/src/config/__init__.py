@@ -2,6 +2,9 @@
 
 The same pattern as Rockwell: ``conf/application.conf`` holds the settings, and ``${VAR}`` values in it
 come from the environment. A variable that is not set reads as empty, and the default below applies.
+
+Source credentials (``KAGGLE_API_TOKEN``, ``HF_TOKEN``) are not settings: the source libraries read
+them from the environment themselves, and nothing here reads or logs them.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from src.utility.keys import parse_tenant_id
 
 APP_DIR = Path(__file__).resolve().parents[2]
 CONF_FILE = APP_DIR / "conf" / "application.conf"
+MANIFEST_DIR = APP_DIR / "manifests" / "documents"
 DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024
 _VARIABLE = re.compile(r"\$\{(\w+)\}")
 # Every enumerated setting is checked at start-up: a typo stops the service at once instead of
@@ -46,10 +50,11 @@ class ServiceSettings:
     version: str
     log_level: str
     cors_origins: tuple[str, ...]
-    # [CONNECTOR]: the tenant everything is ingested for (None until the deployment sets it) and
-    # the ingest bridge's size cap.
+    # [CONNECTOR]: the tenant everything is ingested for (None until the deployment sets it), the
+    # ingest bridge's size cap, and where the document manifests are.
     tenant_id: UUID | None
     max_file_bytes: int
+    manifest_dir: Path
     # [STORAGE]: the root of the development File Store, outbox, receipts and job records.
     data_dir: Path
 
@@ -108,6 +113,7 @@ def load_settings(
         max_file_bytes=_positive_int(
             "max_file_bytes", get("CONNECTOR", "max_file_bytes"), DEFAULT_MAX_FILE_BYTES
         ),
+        manifest_dir=Path(get("CONNECTOR", "manifest_dir") or MANIFEST_DIR),
         data_dir=Path(get("STORAGE", "data_dir", ".data")),
     )
 
