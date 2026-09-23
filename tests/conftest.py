@@ -1,4 +1,7 @@
+import dataclasses
 import logging
+import time
+from uuid import UUID
 
 import pytest
 import yaml
@@ -109,6 +112,50 @@ def manifest_writer(tmp_path):
 
 
 @pytest.fixture
-def client():
-    with TestClient(main.app) as test_client:  # runs the lifespan too
+def settings(tmp_path):
+    """The service settings on temporary data: a tenant, an empty manifest folder, a fresh data dir."""
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    # A development deployment, as the tests' dev-phase manifests need; tests of production
+    # behaviour set the environment themselves.
+    return dataclasses.replace(
+        main.Service,
+        environment="development",
+        data_dir=tmp_path / "data",
+        manifest_dir=manifests,
+        tenant_id=UUID(TENANT),
+    )
+
+
+@pytest.fixture
+def service(settings):
+    """A TestClient factory for the real app on those settings: ``with service() as client:`` runs the
+    lifespan (the job worker) too. Overrides replace settings.
+    """
+
+    def make(**overrides):
+        return TestClient(main.create_app(dataclasses.replace(settings, **overrides)))
+
+    return make
+
+
+@pytest.fixture
+def client(service):
+    with service() as test_client:  # runs the lifespan too
         yield test_client
+
+
+def _wait_for(client, job_id, timeout=10.0):
+    """Poll GET /jobs/{id} the way the scheduler does, until the job is done."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = client.get(f"/jobs/{job_id}").json()
+        if job["status"] in ("succeeded", "failed"):
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not finish: {job}")
+
+
+@pytest.fixture
+def wait_for():
+    return _wait_for

@@ -21,6 +21,7 @@ EVERY_VARIABLE = {
     "NICKEL_MAX_FILE_BYTES": "123",
     "NICKEL_MANIFEST_DIR": "somewhere/manifests",
     "NICKEL_DATA_DIR": "somewhere",
+    "NICKEL_JOBS_MAX_QUEUED": "5",
 }
 
 
@@ -35,6 +36,7 @@ def test_the_shipped_configuration_falls_back_to_the_defaults():
     assert settings.max_file_bytes == DEFAULT_MAX_FILE_BYTES == 100 * 1024 * 1024
     assert settings.manifest_dir == MANIFEST_DIR
     assert settings.data_dir == Path(".data")
+    assert settings.max_queued_jobs == 100
 
 
 def test_the_shipped_configuration_reads_every_variable():
@@ -47,6 +49,7 @@ def test_the_shipped_configuration_reads_every_variable():
     assert settings.max_file_bytes == 123
     assert settings.manifest_dir == Path("somewhere/manifests")
     assert settings.data_dir == Path("somewhere")
+    assert settings.max_queued_jobs == 5
 
 
 def test_the_shipped_configuration_names_no_other_variables():
@@ -82,6 +85,8 @@ def test_the_environment_name_is_case_insensitive():
         ("NICKEL_TENANT_ID", "00000000-0000-0000-0000-000000000000", "nil UUID"),
         ("NICKEL_MAX_FILE_BYTES", "lots", "max_file_bytes must be a whole number"),
         ("NICKEL_MAX_FILE_BYTES", "0", "max_file_bytes must be a positive"),
+        ("NICKEL_JOBS_MAX_QUEUED", "0", "jobs max_queued must be a positive"),
+        ("NICKEL_JOBS_MAX_QUEUED", "many", "jobs max_queued must be a whole number"),
     ],
 )
 def test_an_unknown_value_is_refused_by_name(variable, value, message):

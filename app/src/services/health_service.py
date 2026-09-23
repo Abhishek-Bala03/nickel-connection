@@ -5,9 +5,8 @@ the event loop, so a probe still answers while blocking routes hold every worker
 queueing behind them until K3s restarts a healthy pod. SonarQube's S7503 is silenced for them.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
-from src.config import Service
 from src.models import HealthResponse, ReadyResponse, VersionResponse
 
 health_router = APIRouter(tags=["health"])
@@ -26,7 +25,8 @@ async def ready() -> ReadyResponse:  # NOSONAR(S7503)
 
 
 @health_router.get("/version")
-def version() -> VersionResponse:
+def version(request: Request) -> VersionResponse:
+    settings = request.app.state.settings  # the app's own (main.create_app)
     return VersionResponse(
-        name=Service.name, version=Service.version, environment=Service.environment
+        name=settings.name, version=settings.version, environment=settings.environment
     )

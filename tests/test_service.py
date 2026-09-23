@@ -15,7 +15,13 @@ from fastapi.testclient import TestClient
 
 import main
 from src.config import Service
-from src.error import BadRequestError, ConflictError, NotFoundError, UpstreamError
+from src.error import (
+    BadRequestError,
+    ConflictError,
+    NotFoundError,
+    UnavailableError,
+    UpstreamError,
+)
 from src.middlewares import request_timing
 
 UI = "http://localhost:3000"
@@ -25,15 +31,13 @@ def _errors(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
     return [r for r in records if r.levelno >= logging.ERROR]
 
 
-def _service(monkeypatch=None, **settings) -> FastAPI:
+def _service(**settings) -> FastAPI:
     """The real app, with every middleware and handler; settings override the service settings."""
-    if settings:
-        monkeypatch.setattr(main, "Service", dataclasses.replace(Service, **settings))
-    return main.create_app()
+    return main.create_app(dataclasses.replace(Service, **settings))
 
 
-def _raising(error: Exception, monkeypatch=None, **settings) -> TestClient:
-    app = _service(monkeypatch, **settings)
+def _raising(error: Exception, **settings) -> TestClient:
+    app = _service(**settings)
 
     @app.get("/boom")
     def boom():
@@ -52,11 +56,11 @@ def test_ready(client):
     assert client.get("/ready").json() == {"status": "ready", "checks": {}}
 
 
-def test_version_reports_the_service(client):
+def test_version_reports_the_service(client, settings):
     assert client.get("/version").json() == {
-        "name": Service.name,
-        "version": Service.version,
-        "environment": Service.environment,
+        "name": settings.name,
+        "version": settings.version,
+        "environment": settings.environment,
     }
 
 
@@ -125,6 +129,7 @@ def test_slow_requests_are_logged(client, monkeypatch, records):
         (NotFoundError("no such connection"), 404, "not_found"),
         (ConflictError("already exists"), 409, "conflict"),
         (UpstreamError("vendor down"), 502, "upstream_error"),
+        (UnavailableError("no tenant"), 503, "unavailable"),
     ],
 )
 def test_service_errors_become_json_with_their_status(error, status, code):
@@ -188,8 +193,8 @@ def test_an_error_after_the_response_started_is_not_answered_twice():
         client.get("/stream")
 
 
-def test_an_unexpected_error_keeps_the_cors_headers(monkeypatch):
-    client = _raising(RuntimeError("x"), monkeypatch, cors_origins=(UI,))
+def test_an_unexpected_error_keeps_the_cors_headers():
+    client = _raising(RuntimeError("x"), cors_origins=(UI,))
     response = client.get("/boom", headers={"Origin": UI})
     assert response.status_code == 500
     assert response.headers["access-control-allow-origin"] == UI
@@ -291,8 +296,8 @@ def test_cors_is_off_unless_origins_are_configured(client):
     assert "access-control-allow-origin" not in response.headers
 
 
-def test_cors_allows_the_configured_origins_and_shows_them_the_request_id(monkeypatch):
-    client = TestClient(_service(monkeypatch, cors_origins=(UI,)))
+def test_cors_allows_the_configured_origins_and_shows_them_the_request_id():
+    client = TestClient(_service(cors_origins=(UI,)))
     preflight = client.options(
         "/health", headers={"Origin": UI, "Access-Control-Request-Method": "GET"}
     )
@@ -308,7 +313,7 @@ def test_cors_allows_the_configured_origins_and_shows_them_the_request_id(monkey
 @pytest.mark.parametrize(
     ("environment", "status"), [("development", 200), ("qa", 200), ("production", 404)]
 )
-def test_api_docs_are_off_in_production(monkeypatch, environment, status):
-    client = TestClient(_service(monkeypatch, environment=environment))
+def test_api_docs_are_off_in_production(environment, status):
+    client = TestClient(_service(environment=environment))
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == status

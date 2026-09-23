@@ -57,6 +57,8 @@ class ServiceSettings:
     manifest_dir: Path
     # [STORAGE]: the root of the development File Store, outbox, receipts and job records.
     data_dir: Path
+    # [JOBS]: how many jobs may wait in the queue; a POST /jobs/* beyond it is a 429.
+    max_queued_jobs: int
 
 
 def _tenant(raw: str) -> UUID | None:
@@ -115,6 +117,9 @@ def load_settings(
         ),
         manifest_dir=Path(get("CONNECTOR", "manifest_dir") or MANIFEST_DIR),
         data_dir=Path(get("STORAGE", "data_dir", ".data")),
+        max_queued_jobs=_positive_int(
+            "jobs max_queued", get("JOBS", "max_queued"), 100
+        ),
     )
 
 

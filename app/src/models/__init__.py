@@ -1,5 +1,5 @@
-"""Request and response models (Pydantic). One module per area: ``envelope`` (the raw_data envelope);
-the health models are here."""
+"""Request and response models (Pydantic). One module per area: ``envelope`` (the raw_data envelope),
+``jobs`` (the jobs API), ``documents`` (the receipts); the health models are here."""
 
 from typing import Literal
 

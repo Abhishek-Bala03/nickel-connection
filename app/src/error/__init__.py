@@ -40,6 +40,8 @@ _NO_BODY = (204, 304)
 class NickelConnectionError(Exception):
     status_code = 500
     code = "internal_error"
+    # Sent with the response: Retry-After on a 429.
+    headers: Mapping[str, str] | None = None
 
     def __init__(self, message: str = "Something went wrong") -> None:
         super().__init__(message)
@@ -61,11 +63,31 @@ class ConflictError(NickelConnectionError):
     code = "conflict"
 
 
+class TooManyRequestsError(NickelConnectionError):
+    """The caller must wait: the job queue is full. ``Retry-After`` says for how long, in seconds."""
+
+    status_code = 429
+    code = "too_many_requests"
+
+    def __init__(self, message: str, retry_after_s: int) -> None:
+        super().__init__(message)
+        self.headers = {"Retry-After": str(retry_after_s)}
+
+
 class UpstreamError(NickelConnectionError):
     """A source system or vendor API failed."""
 
     status_code = 502
     code = "upstream_error"
+
+
+class UnavailableError(NickelConnectionError):
+    """Something the operation needs is not there, such as a setting (``NICKEL_TENANT_ID``). The
+    request is fine; the deployment is not ready for it.
+    """
+
+    status_code = 503
+    code = "unavailable"
 
 
 def _request_id(request: Request) -> str | None:
@@ -102,7 +124,7 @@ def handle_service_error(request: Request, exc: NickelConnectionError) -> JSONRe
             _request_id(request),
             exc.message,
         )
-    return _response(request, exc.status_code, exc.code, exc.message)
+    return _response(request, exc.status_code, exc.code, exc.message, exc.headers)
 
 
 def handle_http_error(request: Request, exc: HTTPException) -> Response:
