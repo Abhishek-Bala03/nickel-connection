@@ -16,21 +16,9 @@ from fastapi.testclient import TestClient
 import main
 from src.config import Service
 from src.error import BadRequestError, ConflictError, NotFoundError, UpstreamError
-from src.logging import logger
 from src.middlewares import request_timing
 
 UI = "http://localhost:3000"
-
-
-@pytest.fixture
-def records():
-    """Log records from the service logger (it does not propagate, so caplog cannot see them)."""
-    captured: list[logging.LogRecord] = []
-    handler = logging.Handler()
-    handler.emit = captured.append
-    logger.addHandler(handler)
-    yield captured
-    logger.removeHandler(handler)
 
 
 def _errors(records: list[logging.LogRecord]) -> list[logging.LogRecord]:

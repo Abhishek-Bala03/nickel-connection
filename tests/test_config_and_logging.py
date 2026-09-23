@@ -1,18 +1,25 @@
 """Settings come from the shipped conf/application.conf and the environment; the logger writes once."""
 
 import logging
+import re
+from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from src import __version__
-from src.config import CONF_FILE, load_settings
+from src.config import CONF_FILE, DEFAULT_MAX_FILE_BYTES, load_settings
 from src.logging import LOG_FORMAT, build_logger
 
+TENANT = "0192a3b4-0000-7000-8000-000000000001"
 EVERY_VARIABLE = {
     "NICKEL_ENV": "qa",
     "NICKEL_LOG_LEVEL": "debug",
     "NICKEL_CORS_ORIGINS": "http://a.example, http://b.example ,",
     "APP_VERSION": "1.4.0",
+    "NICKEL_TENANT_ID": TENANT,
+    "NICKEL_MAX_FILE_BYTES": "123",
+    "NICKEL_DATA_DIR": "somewhere",
 }
 
 
@@ -23,6 +30,9 @@ def test_the_shipped_configuration_falls_back_to_the_defaults():
     assert settings.version == __version__
     assert settings.log_level == "INFO"
     assert settings.cors_origins == ()
+    assert settings.tenant_id is None
+    assert settings.max_file_bytes == DEFAULT_MAX_FILE_BYTES == 100 * 1024 * 1024
+    assert settings.data_dir == Path(".data")
 
 
 def test_the_shipped_configuration_reads_every_variable():
@@ -31,6 +41,17 @@ def test_the_shipped_configuration_reads_every_variable():
     assert settings.log_level == "DEBUG"
     assert settings.cors_origins == ("http://a.example", "http://b.example")
     assert settings.version == "1.4.0"
+    assert settings.tenant_id == UUID(TENANT)
+    assert settings.max_file_bytes == 123
+    assert settings.data_dir == Path("somewhere")
+
+
+def test_the_shipped_configuration_names_no_other_variables():
+    # Every ${VAR} the file reads is set above, so a setting added without a test, or one left
+    # behind by a removed feature, shows up here.
+    text = CONF_FILE.read_text(encoding="utf-8")
+    named = set(re.findall(r"^\w+ = \$\{(\w+)\}$", text, flags=re.MULTILINE))
+    assert named == set(EVERY_VARIABLE) - {"APP_VERSION"}
 
 
 def test_values_in_the_file_win_over_the_defaults(tmp_path):
@@ -54,6 +75,10 @@ def test_the_environment_name_is_case_insensitive():
     [
         ("NICKEL_LOG_LEVEL", "LOUD", "log level 'LOUD'"),
         ("NICKEL_ENV", "staging", "environment 'staging'"),
+        ("NICKEL_TENANT_ID", "clinic-one", "tenant_id: .*UUID"),
+        ("NICKEL_TENANT_ID", "00000000-0000-0000-0000-000000000000", "nil UUID"),
+        ("NICKEL_MAX_FILE_BYTES", "lots", "max_file_bytes must be a whole number"),
+        ("NICKEL_MAX_FILE_BYTES", "0", "max_file_bytes must be a positive"),
     ],
 )
 def test_an_unknown_value_is_refused_by_name(variable, value, message):

@@ -1,4 +1,5 @@
-"""Request and response models (Pydantic). One module per area once they grow."""
+"""Request and response models (Pydantic). One module per area: ``envelope`` (the raw_data envelope);
+the health models are here."""
 
 from typing import Literal
 

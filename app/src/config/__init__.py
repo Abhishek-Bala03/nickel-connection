@@ -12,11 +12,17 @@ from collections.abc import Mapping
 from configparser import BasicInterpolation, ConfigParser
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from src import __version__
+from src.utility.keys import parse_tenant_id
 
-CONF_FILE = Path(__file__).resolve().parents[2] / "conf" / "application.conf"
+APP_DIR = Path(__file__).resolve().parents[2]
+CONF_FILE = APP_DIR / "conf" / "application.conf"
+DEFAULT_MAX_FILE_BYTES = 100 * 1024 * 1024
 _VARIABLE = re.compile(r"\$\{(\w+)\}")
+# Every enumerated setting is checked at start-up: a typo stops the service at once instead of
+# failing the first job hours later.
 _LOG_LEVELS = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
 _ENVIRONMENTS = ("development", "qa", "production")
 
@@ -40,6 +46,33 @@ class ServiceSettings:
     version: str
     log_level: str
     cors_origins: tuple[str, ...]
+    # [CONNECTOR]: the tenant everything is ingested for (None until the deployment sets it) and
+    # the ingest bridge's size cap.
+    tenant_id: UUID | None
+    max_file_bytes: int
+    # [STORAGE]: the root of the development File Store, outbox, receipts and job records.
+    data_dir: Path
+
+
+def _tenant(raw: str) -> UUID | None:
+    if not raw:
+        return None
+    try:
+        return parse_tenant_id(raw)
+    except ValueError as exc:
+        raise ValueError(f"tenant_id: {exc}") from exc
+
+
+def _positive_int(name: str, raw: str, default: int) -> int:
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a whole number, not {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be a positive number, not {raw!r}")
+    return value
 
 
 def load_settings(
@@ -50,7 +83,7 @@ def load_settings(
     if not parser.read(path, encoding="utf-8"):
         raise FileNotFoundError(f"service configuration not found: {path}")
 
-    def get(section: str, option: str, default: str) -> str:
+    def get(section: str, option: str, default: str = "") -> str:
         return parser.get(section, option, fallback="").strip() or default
 
     log_level = get("LOGGING", "level", "INFO").upper()
@@ -71,6 +104,11 @@ def load_settings(
         version=environ.get("APP_VERSION", "").strip() or __version__,
         log_level=log_level,
         cors_origins=tuple(o.strip() for o in origins.split(",") if o.strip()),
+        tenant_id=_tenant(get("CONNECTOR", "tenant_id")),
+        max_file_bytes=_positive_int(
+            "max_file_bytes", get("CONNECTOR", "max_file_bytes"), DEFAULT_MAX_FILE_BYTES
+        ),
+        data_dir=Path(get("STORAGE", "data_dir", ".data")),
     )
 
 
