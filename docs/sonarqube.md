@@ -1,5 +1,7 @@
 # SonarQube for free
 
+Prepared by Divij N.
+
 CI runs SonarQube once a server is configured: repository variable `SONAR_HOST_URL` and secret
 `SONAR_TOKEN`. Until then, anyone can run the free **SonarQube Community Build** with Docker, on a laptop
 or a dev server. Code and results stay on that machine.
