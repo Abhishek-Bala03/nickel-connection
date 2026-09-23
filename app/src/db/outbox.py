@@ -31,8 +31,12 @@ from src.logging import logger
 
 RAW_DATA_TOPIC = "raw_data"
 _TOPIC = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
-# Windows: a busy lock is polled at this interval (LK_LOCK would sleep a whole second per try).
-_LOCK_RETRY_S = 0.001
+# How long a publish waits for the outbox lock before it fails: a PublishError, so the receipt says
+# publish_failed and the relay tries again later. A holder that stalls (a stopped command-line run,
+# an fsync stuck on a network volume) must not hang the one job worker while the API fills to 429.
+LOCK_TIMEOUT_S = 30.0
+# A busy lock is polled at this interval: both OS locks are taken without blocking and tried again.
+_LOCK_RETRY_S = 0.005
 # The errnos msvcrt.locking gives for a locking violation, i.e. another process holds the byte
 # (EACCES for LK_NBLCK; EDEADLOCK for the blocking modes). Only those are worth waiting out.
 _LOCKED_ERRNOS = frozenset({errno.EACCES, errno.EDEADLOCK})
@@ -49,63 +53,81 @@ class Publisher(Protocol):
         key: str,
         value: Mapping[str, Any],
         *,
-        idempotency_key: str | None = None,
+        message_id: str | None = None,
     ) -> None:
         """Return only once the message is durable (Kafka: acks=all). Raise PublishError otherwise.
 
-        ``idempotency_key`` is the message's own id (the envelope's ingest_id, the same on a retry).
-        It travels with the message, so a consumer can drop a repeat; the publisher appends it again.
+        ``message_id`` is the message's own id (the envelope's ingest_id, the same on a retry). It
+        travels with the message, so a consumer can drop a repeat; the publisher appends it again.
+        It is not the envelope's ``idempotency_key``, the sha256 dedup key inside ``value``.
         """
         ...
 
 
-def _lock_functions() -> tuple[Callable[[int], None], Callable[[int], None]]:
-    """(lock, unlock) for an exclusive lock across processes on a file descriptor: ``fcntl.flock``
-    on POSIX, ``msvcrt.locking`` of the first byte on Windows. Chosen when the module loads; the
-    tests inject either module, so both sides run on any OS.
+def _lock_functions() -> tuple[Callable[[int], bool], Callable[[int], None]]:
+    """(try_lock, unlock) for an exclusive lock across processes on a file descriptor.
+    ``try_lock`` takes the lock and returns True, or returns False at once while another holder
+    has it; anything else (a bad descriptor, a file system without locks) never clears, so it is
+    raised and the publish fails as a PublishError at once. ``fcntl.flock`` with
+    ``LOCK_EX | LOCK_NB`` on POSIX, ``msvcrt.locking`` of the first byte with ``LK_NBLCK`` on
+    Windows: neither blocks, so the wait has a deadline on both (``_acquire``). Chosen when the
+    module loads; the tests inject either module, so both sides run on any OS.
     """
     try:
         import fcntl
     except ImportError:  # Windows
         import msvcrt
 
-        def lock(fd: int) -> None:
-            while True:
-                try:
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                    return
-                except OSError as exc:
-                    # Another process holds it: wait. Anything else (a bad descriptor, a file
-                    # system without byte-range locks) never clears, so it is raised and the
-                    # publish fails as a PublishError instead of polling for ever.
-                    if exc.errno not in _LOCKED_ERRNOS:
-                        raise
-                    time.sleep(_LOCK_RETRY_S)
+        def try_lock(fd: int) -> bool:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if exc.errno not in _LOCKED_ERRNOS:
+                    raise
+                return False  # another process holds the byte
+            return True
 
         def unlock(fd: int) -> None:
             msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
 
-        return lock, unlock
+        return try_lock, unlock
 
-    def lock(fd: int) -> None:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    def try_lock(fd: int) -> bool:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:  # EWOULDBLOCK: another holder has it
+            return False
+        return True
 
     def unlock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
-    return lock, unlock
+    return try_lock, unlock
 
 
-_LOCK, _UNLOCK = _lock_functions()
+_TRY_LOCK, _UNLOCK = _lock_functions()
+
+
+def _acquire(fd: int) -> None:
+    """Take the lock, waiting for another holder ``LOCK_TIMEOUT_S`` at most. Past that, a
+    TimeoutError (an OSError, so the publish fails as a content-free PublishError)."""
+    deadline = time.monotonic() + LOCK_TIMEOUT_S
+    while not _TRY_LOCK(fd):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"the outbox lock was not free within {LOCK_TIMEOUT_S:g} seconds"
+            )
+        time.sleep(_LOCK_RETRY_S)
 
 
 @contextmanager
 def _exclusive(lock_path: Path) -> Iterator[None]:
-    """Hold the lock file exclusively across processes for the block; waits for another holder.
-    The file stays empty: only its lock matters, and closing it releases the lock too.
+    """Hold the lock file exclusively across processes for the block; waits for another holder
+    ``LOCK_TIMEOUT_S`` at most. The file stays empty: only its lock matters, and closing it
+    releases the lock too.
     """
     with lock_path.open("ab") as handle:
-        _LOCK(handle.fileno())
+        _acquire(handle.fileno())
         try:
             yield
         finally:
@@ -144,7 +166,8 @@ def _parse(raw: bytes) -> dict[str, Any] | None:
 
 class JsonlOutbox:
     """One JSON line per message per topic, appended under the topic's lock (``<topic>.jsonl.lock``,
-    exclusive across processes), flushed and fsynced before ``publish`` returns. A repeat of a
+    exclusive across processes, waited for ``LOCK_TIMEOUT_S`` at most), flushed and fsynced before
+    ``publish`` returns. A repeat of a
     message is appended again, under the same ``id`` (at-least-once). A line a crashed writer left
     half out is sealed by the next append (a newline first), so it stays a fragment readers skip
     instead of becoming the head of the next record.
@@ -164,12 +187,12 @@ class JsonlOutbox:
         key: str,
         value: Mapping[str, Any],
         *,
-        idempotency_key: str | None = None,
+        message_id: str | None = None,
     ) -> None:
         path = self._path(topic)
         record: dict[str, Any] = {"topic": topic, "key": key}
-        if idempotency_key is not None:
-            record["id"] = idempotency_key
+        if message_id is not None:
+            record["id"] = message_id
         record["value"] = dict(value)
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         try:
@@ -185,9 +208,16 @@ class JsonlOutbox:
                     handle.flush()
                     os.fsync(handle.fileno())
         except OSError as exc:
-            # The OS message names the outbox file; it goes to the log. The error's text is what
-            # the receipt keeps as its detail and GET /documents shows: the topic and the type.
-            logger.error("could not append to the %s outbox: %s", topic, exc)
+            # The OS error's text names the file (``str(exc)`` quotes the path): the log gets its
+            # type and the OS's reason (``strerror``: "Permission denied", "No space left on
+            # device"), never a path. The error's text is what the receipt keeps as its detail and
+            # GET /documents shows: the topic and the type.
+            logger.error(
+                "could not append to the %s outbox: %s (%s)",
+                topic,
+                type(exc).__name__,
+                exc.strerror or "no OS reason",
+            )
             raise PublishError(
                 f"could not append to the {topic} outbox: {type(exc).__name__}"
             ) from exc

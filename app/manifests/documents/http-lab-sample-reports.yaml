@@ -10,7 +10,8 @@ fetch: http
 auth:
   type: none
   vault_path: null
-schedule: on_demand
+schedule:
+  class: F4  # on demand (CN-01 frequency class): the scheduler or an operator starts a pull
 formats: [pdf]
 phi: false
 owner: divij

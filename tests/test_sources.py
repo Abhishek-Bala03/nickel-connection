@@ -13,6 +13,7 @@ from src.connectors.documents.sources import (
     KaggleSource,
     LocalDirSource,
     RefusedError,
+    TooLargeError,
 )
 
 CAP = 100  # the size cap every source takes (the connector passes the cap in force)
@@ -51,9 +52,10 @@ def test_a_missing_folder_is_a_fetch_error_that_names_no_path(tmp_path, records)
     files = _local(tmp_path / "missing").files()
     with pytest.raises(FetchError) as caught:
         next(files)
-    # A job record keeps this text: the locator, never the path (a clinic's folder names).
+    # A job record keeps this text, and the log the same: the locator, never the path (a
+    # clinic's folder names).
     assert str(caught.value) == "local missing: not a folder"
-    assert [str(tmp_path / "missing") in r.getMessage() for r in records] == [True]
+    assert [r.getMessage() for r in records] == ["local source missing: not a folder"]
 
 
 # ── Kaggle ───────────────────────────────────────────────────────────────────
@@ -93,10 +95,8 @@ def test_kaggle_failures_become_content_free_fetch_errors(records):
     with pytest.raises(FetchError) as caught:
         next(whole_dataset)
     assert str(caught.value) == "kaggle o/d: RuntimeError"
-    # The library's message, a file name and all, is in the log and nowhere else.
-    assert [r.getMessage() for r in records] == [
-        "kaggle o/d: RuntimeError: 403 Forbidden for /cache/Jane-Doe-biopsy.pdf"
-    ] * 2
+    # The library's message quotes the file: the log gets the locator and the type only.
+    assert [r.getMessage() for r in records] == ["kaggle o/d: RuntimeError"] * 2
 
 
 def test_kaggle_uses_kagglehub_by_default(monkeypatch, tmp_path):
@@ -165,8 +165,8 @@ def test_huggingface_failures_become_content_free_fetch_errors(records):
         item.fetch()
     assert str(caught.value) == "huggingface o/d: RuntimeError"
     assert [r.getMessage() for r in records] == [
-        "huggingface o/d@main: RuntimeError: gone",
-        "huggingface o/d@main: RuntimeError: rate limited fetching Jane-Doe-biopsy.pdf",
+        "huggingface o/d@main: RuntimeError",
+        "huggingface o/d@main: RuntimeError",
     ]
 
 
@@ -182,8 +182,11 @@ def test_a_file_over_the_cap_is_never_read_into_memory(tmp_path):
         download=lambda handle, path=None: str(tmp_path / path),
     )
     [item] = list(kaggle.files())
-    with pytest.raises(FetchError, match="^kaggle o/d: larger than the 4-byte cap$"):
+    with pytest.raises(
+        TooLargeError, match="^kaggle o/d: larger than the 4-byte cap$"
+    ) as caught:
         item.fetch()
+    assert caught.value.size == 5  # the size on disk: the connector's receipt says it
     hub = HuggingFaceSource(
         "o/d",
         max_bytes=4,
@@ -241,9 +244,10 @@ def test_http_stops_at_the_size_cap():
         ).files()
     )
     with pytest.raises(
-        FetchError, match="^https://a.example: larger than the 10-byte cap$"
-    ):
+        TooLargeError, match="^https://a.example: larger than the 10-byte cap$"
+    ) as caught:
         item.fetch()
+    assert caught.value.size is None  # the download stopped at the cap: no size known
 
 
 def test_http_errors_become_fetch_errors():
@@ -704,3 +708,48 @@ def test_a_download_is_spooled_to_a_temporary_file_and_hashed(monkeypatch):
     item = _only(_source(["https://lab.example/x.pdf"], handler))
     assert item.fetch() == content
     assert len(spools) == 1 and spools[0].closed  # gone once the bytes are handed on
+
+
+# ── HTTP: TLS trust ──────────────────────────────────────────────────────────
+def test_the_pinned_transport_trusts_the_bundled_cas_not_the_environment(
+    monkeypatch, tmp_path
+):
+    """The review's probe: httpx.create_ssl_context() defaults to trust_env=True, so SSL_CERT_FILE
+    or SSL_CERT_DIR replaced the CA bundle of the pinned transport; and super().__init__() built a
+    pool (with that context) only for it to be replaced. One pool now, on the bundled CAs.
+    """
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "someone-elses-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
+    pools = []
+    real_pool = httpcore.ConnectionPool
+
+    class Counted(real_pool):
+        def __init__(self, *args, **kwargs):
+            pools.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpcore, "ConnectionPool", Counted)
+    sources._PinnedTransport(sources.PinnedBackend({}))
+    [pool] = pools  # the pinned one, and no throwaway
+    assert isinstance(pool["network_backend"], sources.PinnedBackend)
+    # The bundle httpx ships holds a hundred-odd CAs; the environment's file is not even there.
+    assert pool["ssl_context"].cert_store_stats()["x509_ca"] > 50
+
+
+def test_the_source_opens_its_client_with_trust_env_off(monkeypatch):
+    opened = []
+    real_client = httpx.Client
+
+    def client(**kwargs):
+        opened.append(kwargs.get("trust_env"))
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client)
+    source = HttpSource(
+        ["https://a.example/x.pdf"],
+        max_bytes=10,
+        resolver=lambda host: [PUBLIC],
+        network=RecordingBackend(OK_PDF),
+    )
+    assert _only(source).fetch() == b"%PDF"
+    assert opened == [False]

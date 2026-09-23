@@ -1,6 +1,11 @@
 """The service's logger (use: ``from src.logging import logger``), as in Rockwell.
 
-Logs go to stdout for the container runtime to collect. Never log secrets, tokens or patient data.
+Logs go to stdout for the container runtime to collect. Never log secrets, tokens or patient data:
+ids, counts, hashes and error types only (a clinic's file names carry patient names, so paths and
+file names count as patient data, and so does a library's exception text, which can quote them).
+
+The logger exists at import under a fixed name; its level comes from the settings of whatever starts
+(``main.create_app`` calls ``configure_logging`` with the service's; the command line sets its own).
 """
 
 from __future__ import annotations
@@ -8,8 +13,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from src.config import Service
-
+LOGGER_NAME = "nickel-connection"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _HANDLER_NAME = "nickel-stdout"
 
@@ -27,4 +31,9 @@ def build_logger(name: str, level: str) -> logging.Logger:
     return log
 
 
-logger = build_logger(Service.name, Service.log_level)
+def configure_logging(level: str) -> None:
+    """Set the service logger's level from the settings (``ServiceSettings.log_level``)."""
+    logger.setLevel(level)
+
+
+logger = build_logger(LOGGER_NAME, "INFO")

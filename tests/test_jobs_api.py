@@ -224,6 +224,7 @@ def test_a_pull_job_runs_and_reports_its_counts(
             "published": 1,
             "duplicates": 0,
             "rejected": 0,
+            "too_large": 0,
             "skipped": 0,
             "refused": 0,
             "held": 0,
@@ -371,8 +372,8 @@ def test_an_invalid_manifest_fails_the_job(
         ).json()["job_id"]
         job = wait_for(client, job_id)
         assert job["status"] == "failed"
-        # pydantic's error quotes the input: a foreign error is its type alone (the CLI shows why).
-        assert job["error"] == "ValidationError"
+        # What does not validate and why, content-free (pydantic's message quotes the input).
+        assert job["error"] == "manifest does not validate: license string_too_short"
 
 
 def test_jobs_run_one_after_another_and_list_newest_first(

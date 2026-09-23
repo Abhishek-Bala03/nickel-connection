@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import logging
+import os
 import re
 import threading
 
@@ -14,7 +15,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 import main
-from src.config import Service
+from src.config import CONF_FILE, load_settings
 from src.error import (
     BadRequestError,
     ConflictError,
@@ -25,6 +26,9 @@ from src.error import (
 from src.middlewares import request_timing
 
 UI = "http://localhost:3000"
+# Every route but the probes needs the service token (src.services.auth); these tests call their own
+# routes with it, as the scheduler and the API layer do.
+AUTH = {"Authorization": f"Bearer {os.environ['NICKEL_SERVICE_TOKEN']}"}
 
 
 def _errors(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
@@ -33,7 +37,7 @@ def _errors(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
 
 def _service(**settings) -> FastAPI:
     """The real app, with every middleware and handler; settings override the service settings."""
-    return main.create_app(dataclasses.replace(Service, **settings))
+    return main.create_app(dataclasses.replace(load_settings(), **settings))
 
 
 def _raising(error: Exception, **settings) -> TestClient:
@@ -43,7 +47,7 @@ def _raising(error: Exception, **settings) -> TestClient:
     def boom():
         raise error
 
-    return TestClient(app, raise_server_exceptions=False)
+    return TestClient(app, raise_server_exceptions=False, headers=AUTH)
 
 
 def test_health(client):
@@ -77,7 +81,9 @@ def test_health_answers_while_blocking_routes_hold_every_worker_thread():
         limiter = anyio.to_thread.current_default_thread_limiter()
         limiter.total_tokens = 2
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as http:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://t", headers=AUTH
+        ) as http:
             blockers = [asyncio.create_task(http.get("/blocking")) for _ in range(2)]
             try:
                 with anyio.fail_after(5):
@@ -187,7 +193,7 @@ def test_an_error_after_the_response_started_is_not_answered_twice():
     def stream():
         return StreamingResponse(broken_stream())
 
-    client = TestClient(app)
+    client = TestClient(app, headers=AUTH)
     # The status line is already out, so the error goes up to the server instead of a second reply.
     with pytest.raises(RuntimeError, match="stream broke"):
         client.get("/stream")
@@ -278,7 +284,7 @@ def test_an_invalid_request_uses_the_error_shape_and_does_not_echo_the_input():
     def item(item_id: int):
         return {"item_id": item_id}
 
-    response = TestClient(app).get("/items/not-a-number-SECRET")
+    response = TestClient(app, headers=AUTH).get("/items/not-a-number-SECRET")
     assert response.status_code == 422
     error = response.json()["error"]
     assert error["code"] == "validation_error"
@@ -311,9 +317,39 @@ def test_cors_allows_the_configured_origins_and_shows_them_the_request_id():
 
 
 @pytest.mark.parametrize(
-    ("environment", "status"), [("development", 200), ("qa", 200), ("production", 404)]
+    ("environment", "status"), [("development", 200), ("qa", 404), ("production", 404)]
 )
-def test_api_docs_are_off_in_production(environment, status):
-    client = TestClient(_service(environment=environment))
+def test_api_docs_are_on_in_development_only(environment, status):
+    client = TestClient(_service(environment=environment), headers=AUTH)
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == status
+
+
+def test_api_docs_are_off_unless_the_environment_is_set_explicitly():
+    unset = load_settings(CONF_FILE, environ={})  # a deployment that sets no NICKEL_ENV
+    client = TestClient(_service(environment=unset.environment), headers=AUTH)
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert client.get(path).status_code == 404
+
+
+def test_the_app_runs_on_the_settings_it_is_given():
+    """``create_app(settings)``: the settings are an argument, not a module global to patch, and the
+    routes read the app's own (``/version``, and whether the API docs are served)."""
+    given = dataclasses.replace(
+        load_settings(),
+        name="nickel-connection-given",
+        version="9.9.9",
+        environment="qa",
+    )
+    app = main.create_app(given)
+    assert app.state.settings is given
+    with TestClient(app, headers=AUTH) as client:
+        assert client.get("/version").json() == {
+            "name": "nickel-connection-given",
+            "version": "9.9.9",
+            "environment": "qa",
+        }
+        assert client.get("/docs").status_code == 404  # no docs outside development
+    development = dataclasses.replace(given, environment="development")
+    with TestClient(main.create_app(development), headers=AUTH) as client:
+        assert client.get("/docs").status_code == 200

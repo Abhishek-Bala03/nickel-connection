@@ -6,7 +6,8 @@ The queue is bounded (``[JOBS] max_queued``: a 429 beyond it) and a submission c
 instead of a second one.
 
 Two kinds of job: ``documents.pull`` brings a source in, ``documents.republish`` publishes the open
-receipts again from the envelopes they store. The connection layer ends at ``raw_data``, and what
+receipts again from the envelopes they store. The scheduler queues a republish on a fixed cadence,
+and the worker queues one itself when it starts (``build_runner``). The connection layer ends at ``raw_data``, and what
 happens to a document after that (parsing, OCR, extraction) is the Document worker's, a service of
 its own. A job's id (a UUIDv7) is the ``trace_id`` of its run: every envelope the run publishes
 carries it.
@@ -19,13 +20,14 @@ from __future__ import annotations
 
 import queue
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
 from src.config import ServiceSettings
+from src.connectors.documents import ManifestError
 from src.connectors.documents.sources import FetchError
 from src.db.jobs import INTERRUPTED, Job, JobStatus, JobStore
 from src.db.layout import DataLayout
@@ -44,10 +46,11 @@ RETRY_AFTER_S = 30  # what a 429 tells the scheduler (docs/jobs-api.md)
 _STOP = object()
 _ERROR_CHARS = 1000
 # Errors whose message is content-free by contract: the service's own, a source that could not be
-# listed (FetchError: the manifest's locator, never a file's content) and a publish failure. Any other
-# exception may quote what it choked on (pydantic's ValidationError prints the rejected input, an
-# OSError a path with a clinic's file name), so the record keeps its type alone.
-_OWN_ERRORS = (NickelConnectionError, FetchError, PublishError)
+# listed (FetchError: the manifest's locator, never a file's content), a manifest that does not load
+# (ManifestError: field names and error types, never the file's values) and a publish failure. Any
+# other exception may quote what it choked on (pydantic's ValidationError prints the rejected input,
+# an OSError a path with a clinic's file name), so the record keeps its type alone.
+_OWN_ERRORS = (NickelConnectionError, FetchError, ManifestError, PublishError)
 
 
 @dataclass(frozen=True)
@@ -98,18 +101,23 @@ def _counts_text(counts: Mapping[str, int]) -> str:
 
 
 class JobRunner:
-    """A FIFO queue of job ids and the one thread that works through it."""
+    """A FIFO queue of job ids and the one thread that works through it. ``startup`` names the
+    jobs (kind, params) it queues itself when it starts, after the ones a previous process left
+    queued."""
 
     def __init__(
         self,
         settings: ServiceSettings,
         store: JobStore,
         handlers: Mapping[str, JobHandler],
+        *,
+        startup: Sequence[tuple[str, Mapping[str, Any]]] = (),
     ) -> None:
         self.settings = settings
         self.store = store
         self.max_queued = settings.max_queued_jobs
         self._handlers = dict(handlers)
+        self._startup = tuple(startup)
         self._queue: queue.Queue[Any] = queue.Queue()
         self._submit_lock = threading.Lock()
         self._stopping = threading.Event()
@@ -129,6 +137,15 @@ class JobRunner:
             self._queue.put(job_id)
         if queued:
             logger.info("%d queued job(s) picked up again", len(queued))
+        # Not held to the queue's bound: the service's own start-up jobs are not a caller to 429.
+        # One that still waits from a start before (the worker never took it: a crash loop, say)
+        # is not queued again, or every start would add one and fill the queue. (Job records have
+        # no tenant: a deployment runs for one.)
+        waiting = [self.store.get(job_id) for job_id in queued]
+        for kind, params in self._startup:
+            if any(job.kind == kind and job.params == dict(params) for job in waiting):
+                continue
+            self._add(kind, params, idempotency_key=None)
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -173,18 +190,25 @@ class JobRunner:
                     f"{self.max_queued} jobs are queued already; try again after Retry-After",
                     retry_after_s=RETRY_AFTER_S,
                 )
-            job = Job(
-                job_id=str(uuid7()),
-                kind=kind,
-                status=JobStatus.QUEUED,
-                params=params,
-                created_at=_now(),
-                idempotency_key=idempotency_key,
-            )
-            self.store.add(job)
-            self._queue.put(job.job_id)
-        logger.info("job %s %s queued", job.job_id, kind)
+            job = self._add(kind, params, idempotency_key=idempotency_key)
         return job, True
+
+    def _add(
+        self, kind: str, params: Mapping[str, Any], *, idempotency_key: str | None
+    ) -> Job:
+        """Record a queued job and put it on the queue."""
+        job = Job(
+            job_id=str(uuid7()),
+            kind=kind,
+            status=JobStatus.QUEUED,
+            params=dict(params),
+            created_at=_now(),
+            idempotency_key=idempotency_key,
+        )
+        self.store.add(job)
+        self._queue.put(job.job_id)
+        logger.info("job %s %s queued", job.job_id, kind)
+        return job
 
     def get(self, job_id: str) -> Job | None:
         return self.store.get(job_id)
@@ -266,11 +290,24 @@ class JobRunner:
         logger.info("job %s %s %s: %s", job.job_id, job.kind, status, counts)
 
 
-def build_runner(settings: ServiceSettings) -> JobRunner:
+def build_runner(
+    settings: ServiceSettings, *, republish_at_start: bool = True
+) -> JobRunner:
+    """The worker for this deployment. Unless told otherwise, it queues one republish of the open
+    receipts when it starts (after the jobs a previous process left queued): the relay then runs
+    at least once per start, a restart after a crash included, whether or not the scheduler calls
+    it on its cadence yet (docs/jobs-api.md). Not without a tenant: the relay needs one.
+    """
     handlers: dict[str, JobHandler] = {
         PULL_KIND: lambda job: run_pull(settings, job),
         REPUBLISH_KIND: lambda job: run_republish(settings, job),
     }
+    startup = []
+    if republish_at_start and settings.tenant_id is not None:
+        startup.append((REPUBLISH_KIND, {"source": None, "limit": None}))
     return JobRunner(
-        settings, JobStore(DataLayout(settings.data_dir).jobs_db), handlers
+        settings,
+        JobStore(DataLayout(settings.data_dir).jobs_db),
+        handlers,
+        startup=startup,
     )

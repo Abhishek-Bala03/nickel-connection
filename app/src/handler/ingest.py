@@ -3,7 +3,9 @@
 1. Edge checks only: not empty, under the size cap, and the bytes really are a declared format.
    Anything deeper (schema, codes, patient) is the Transform layer's job. An empty or wrong-format
    payload is rejected for good (the same bytes can never pass); one over the cap is receipted as
-   too_large and goes through once NICKEL_MAX_FILE_BYTES is raised.
+   too_large and goes through once NICKEL_MAX_FILE_BYTES is raised. A file a pull skips for size
+   before it has the bytes gets a too_large receipt too (``too_large``: metadata only, keyed by a
+   surrogate, one per item), which the item's own receipt supersedes once it comes in.
 2. The original goes to the File Store under a tenant-first, content-addressed key.
 3. A receipt records it, with the envelope as built, then the envelope is published for the
    Transform layer. Under shadow mode (the manifest's ``shadow: true``) the original and the receipt
@@ -38,11 +40,20 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID
 
+from pydantic import ValidationError
+
 from src.config import DEFAULT_MAX_FILE_BYTES
 from src.db.file_store import FileStore
 from src.db.outbox import RAW_DATA_TOPIC, Publisher, PublishError
-from src.db.receipts import Receipt, ReceiptStatus, ReceiptStore
-from src.models.envelope import Envelope, idempotency_key_of
+from src.db.receipts import Receipt, ReceiptStatus, ReceiptStore, too_large_key
+from src.logging import logger
+from src.models.envelope import (
+    ENVELOPE_VERSION,
+    Envelope,
+    ProducedEnvelope,
+    idempotency_key_of,
+    newer_than_written,
+)
 from src.utility.ids import uuid7
 from src.utility.keys import ObjectClass, object_key, parse_tenant_id
 
@@ -50,6 +61,23 @@ from src.utility.keys import ObjectClass, object_key, parse_tenant_id
 FORMATS: dict[str, tuple[str, Callable[[bytes], bool]]] = {
     "pdf": ("application/pdf", lambda data: b"%PDF-" in data[:1024]),
 }
+_PROBLEMS_SHOWN = 5  # a set-aside receipt's reason names at most this many problems
+
+
+def _envelope_problem(exc: ValidationError) -> str:
+    """Why a stored envelope was set aside, content-free: each problem is pydantic's error type,
+    after the top-level field it is on (one of the model's own names), never pydantic's message,
+    which quotes the input: a stored envelope holds the item's path at the source."""
+    problems = sorted(
+        {
+            f"{error['loc'][0]} {error['type']}" if error["loc"] else error["type"]
+            for error in exc.errors()
+        }
+    )
+    shown = ", ".join(problems[:_PROBLEMS_SHOWN])
+    if len(problems) > _PROBLEMS_SHOWN:
+        shown += f" and {len(problems) - _PROBLEMS_SHOWN} more"
+    return f"stored envelope set aside: {shown}"
 
 
 @dataclass(frozen=True)
@@ -60,7 +88,7 @@ class SourceContext:
     source: str
     fetch: str  # how the items are fetched (the manifest's fetch): kaggle, http, local, ...
     route: str  # the lab route (the manifest's route, L1-L9) the fidelity ranking reads
-    mode: str  # the manifest's mode: pull, stream or push
+    mode: str  # the manifest's mode: pull, stream, listener, upload or mobile
     connector: str
     connector_version: str
     retention_class: ObjectClass
@@ -86,6 +114,10 @@ class Outcome(StrEnum):
     DUPLICATE = "duplicate"
     TOO_LARGE = "too_large"  # over the cap for now: through once NICKEL_MAX_FILE_BYTES is raised
     REJECTED = "rejected"  # final: the same bytes can never pass
+    # The relay only: the receipt's stored envelope does not validate, or is newer than this
+    # service writes, so nothing was published; the receipt says why, and the next pull of its item
+    # publishes an envelope it builds again (the stored one stays as it was).
+    BAD_ENVELOPE = "bad_envelope"
 
 
 @dataclass(frozen=True)
@@ -96,6 +128,39 @@ class IngestResult:
     payload_ref: str | None = None
     new_object: bool = False
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """An item stored and receipted whose envelope is still to be published."""
+
+    receipt: Receipt
+    envelope: Envelope
+    new_object: bool
+
+
+def _first_built(existing: Receipt | None, built: ProducedEnvelope) -> Envelope:
+    """What a publish sends: the envelope the receipt keeps, first built when the item was first
+    received, so that every attempt (a retry, a promotion, the relay) is the same message. The
+    receipt never has it replaced (``COALESCE(envelope, ?)``), so ``built`` is what it keeps only
+    when it had none. One that no longer reads, or that a newer version of this service wrote
+    (which going out again as this version would strip), is not published: this run's ``built``
+    is.
+    """
+    if existing is None or existing.envelope is None:
+        return built
+    try:
+        stored = Envelope.model_validate_json(existing.envelope)
+    except ValidationError:
+        return built
+    return built if newer_than_written(stored.envelope_version) else stored
+
+
+def _over_cap(size: int | None, cap: int) -> str:
+    """A too_large receipt's detail, content-free: the size seen, if any, and the cap."""
+    if size is None:
+        return f"over the {cap}-byte cap; the download stopped there"
+    return f"{size} bytes; the cap is {cap}"
 
 
 class IngestBridge:
@@ -123,6 +188,80 @@ class IngestBridge:
     def ingest(self, ctx: SourceContext, item: RawItem) -> IngestResult:
         tenant = str(self.tenant_id)
         sha = hashlib.sha256(item.data).hexdigest()
+        received = self._receive(tenant, ctx, item, sha)
+        # The item's bytes have a receipt now (this run's, or the one another run wrote first). A
+        # too_large receipt an earlier pull left for the item, when it came over the cap and was
+        # never fetched whole, has done its job: it is superseded by that receipt.
+        self.receipts.supersede_too_large(
+            tenant,
+            ctx.source,
+            item.message_id,
+            detail=f"superseded by the receipt of payload {sha}",
+        )
+        if isinstance(received, IngestResult):
+            return received
+        return self._publish(
+            received.receipt, received.envelope, ctx.trace_id, received.new_object
+        )
+
+    def too_large(
+        self, ctx: SourceContext, message_id: str, *, size: int | None, cap: int
+    ) -> IngestResult:
+        """Receipt an item a pull skipped for size without its bytes: listed over the cap, a
+        download that passed it, or an SDK file over it on disk. Metadata only: nothing is stored
+        or published, the receipt has no payload ref and no envelope, and its detail gives the size
+        seen and the cap. It is keyed by ``too_large_key`` (``src.db.receipts``), one per item: a
+        repeated pull finds it and adds no row, only bringing its detail up to date. If the item
+        came in within the cap meanwhile (the marker is superseded) and is over the cap in force
+        again, the marker reopens, unless the size seen is the one the item came in at: most
+        likely the same item, already delivered, so nothing is left open for it.
+        """
+        tenant = str(self.tenant_id)
+        key = too_large_key(tenant, ctx.source, message_id)
+        detail = _over_cap(size, cap)
+        marker = self.receipts.find(tenant, ctx.source, message_id, key)
+        if marker is None:
+            stamp = self._clock().isoformat()
+            marker = Receipt(
+                ingest_id=str(self._new_id()),
+                tenant_id=tenant,
+                source=ctx.source,
+                message_id=message_id,
+                payload_sha256=key,
+                status=ReceiptStatus.TOO_LARGE,
+                received_at=stamp,
+                updated_at=stamp,
+                detail=detail,
+            )
+            if not self.receipts.add(marker):
+                # Another pull of the item wrote it first: that receipt is the item's.
+                marker = self.receipts.find(tenant, ctx.source, message_id, key)
+        elif (marker.status, marker.detail) != (
+            ReceiptStatus.TOO_LARGE,
+            detail,
+        ) and not self._delivered_at(marker, size):
+            self.receipts.mark_too_large(marker, detail=detail)
+        return IngestResult(Outcome.TOO_LARGE, marker.ingest_id, key, reason=detail)
+
+    def _delivered_at(self, marker: Receipt, size: int | None) -> bool:
+        """Whether a superseded marker's item is seen again at the size it came in at (its
+        published receipt's stored envelope says so): then it is not reopened. An unknown size,
+        or none published to compare with, reopens it."""
+        return (
+            marker.status is ReceiptStatus.SUPERSEDED
+            and size is not None
+            and size
+            == self.receipts.published_size(
+                marker.tenant_id, marker.source, marker.message_id
+            )
+        )
+
+    def _receive(
+        self, tenant: str, ctx: SourceContext, item: RawItem, sha: str
+    ) -> IngestResult | _Pending:
+        """Everything up to the publish: the edge checks, the File Store, the receipt. What is
+        decided already comes back as a result; an item still to publish, as ``_Pending``.
+        """
         existing = self.receipts.find(tenant, ctx.source, item.message_id, sha)
         settled = self._settled(existing, ctx, sha)
         if settled is not None:
@@ -197,7 +336,7 @@ class IngestBridge:
             return self._lost_race(tenant, ctx, item, sha)
         if ctx.shadow:
             return IngestResult(Outcome.HELD, ingest_id, sha, key, new_object)
-        return self._publish(receipt, envelope, ctx.trace_id, new_object)
+        return _Pending(receipt, _first_built(existing, envelope), new_object)
 
     def _envelope(
         self,
@@ -208,11 +347,13 @@ class IngestBridge:
         content_type: str,
         key: str,
         received_at: datetime,
-    ) -> Envelope:
+    ) -> ProducedEnvelope:
         """The envelope as first built, with this run's id and attempt 1: what the receipt keeps.
-        Every publish stamps the attempt it is and the run that makes it (``_publish``).
+        Every publish stamps the attempt it is and the run that makes it (``_publish``). Built
+        with the strict producer model: a misspelled field here is an error, not a field dropped.
+        The document connector knows no member, device or FHIR release: those stay null.
         """
-        return Envelope(
+        return ProducedEnvelope(
             ingest_id=ingest_id,
             tenant_id=self.tenant_id,
             source=ctx.source,
@@ -233,7 +374,7 @@ class IngestBridge:
             received_at=received_at,
             event_time=item.event_time,
             retention_class=ctx.retention_class.value,
-            payload_sha256=sha,
+            payload_hash=sha,
             payload_bytes=len(item.data),
             payload_ref=key,
             source_meta=item.source_meta,
@@ -271,6 +412,7 @@ class IngestBridge:
         return self.receipts.set_status(
             receipt.ingest_id,
             receipt.status,
+            tenant_id=receipt.tenant_id,
             detail=receipt.detail,
             payload_ref=receipt.payload_ref,
             envelope=receipt.envelope,
@@ -281,25 +423,64 @@ class IngestBridge:
         relay, ``src.handler.documents``): the same ingest id and dedup key, this run's id and the
         next attempt number. Published, or a duplicate if another run got there first; a
         PublishError is recorded on the receipt and raised, as in ``ingest``.
+
+        A stored envelope that does not validate (a corrupt row, or a shape this reader does not
+        take) is set aside, not raised: nothing is published, the receipt keeps its status and
+        records why (content-free), and the result says BAD_ENVELOPE, so the relay goes on to the
+        next receipt instead of stopping at this one on every run.
         """
-        envelope = Envelope.model_validate_json(receipt.envelope)
+        try:
+            envelope = Envelope.model_validate_json(receipt.envelope)
+        except ValidationError as exc:
+            return self._set_aside(receipt, _envelope_problem(exc))
+        if newer_than_written(envelope.envelope_version):
+            # Written by a newer version of this service (before a rollback): going out again as
+            # this version would drop the fields this reader does not know. It waits for that
+            # version, or for a pull of the item, which builds its own.
+            return self._set_aside(
+                receipt, f"stored envelope is newer ({envelope.envelope_version})"
+            )
         return self._publish(receipt, envelope, trace_id, new_object=False)
+
+    def _set_aside(self, receipt: Receipt, reason: str) -> IngestResult:
+        """The receipt's stored envelope is not published: its detail says why (a detail-only
+        write, while the receipt is still in the status it was read in), logged once, when the
+        reason is new. A run that meets the same bad envelope again writes and logs nothing.
+        """
+        if self.receipts.set_aside(receipt, detail=reason):
+            logger.warning("republish: receipt %s: %s", receipt.ingest_id, reason)
+        return IngestResult(
+            Outcome.BAD_ENVELOPE,
+            receipt.ingest_id,
+            receipt.payload_sha256,
+            receipt.payload_ref,
+            reason=reason,
+        )
 
     def _publish(
         self, receipt: Receipt, envelope: Envelope, trace_id: str, new_object: bool
     ) -> IngestResult:
         """Publish the receipt's envelope, stamped with the attempt this is and the run making it,
         and record the outcome on the receipt."""
-        ingest_id, sha, key = (
+        ingest_id, tenant, sha, key = (
             receipt.ingest_id,
+            receipt.tenant_id,
             receipt.payload_sha256,
             receipt.payload_ref,
         )
-        attempt = self.receipts.begin_attempt(ingest_id)
+        attempt = self.receipts.begin_attempt(ingest_id, tenant_id=tenant)
         if attempt is None:
             # Another run retried the same open receipt and published it first.
             return IngestResult(Outcome.DUPLICATE, ingest_id, sha, key)
-        stamped = envelope.model_copy(update={"attempt": attempt, "trace_id": trace_id})
+        # The current version goes out: this one, or a stored v0.2 one, read through the reader's
+        # alias, which is the same values in v0.3's shape (a newer one never gets here).
+        stamped = envelope.model_copy(
+            update={
+                "envelope_version": ENVELOPE_VERSION,
+                "attempt": attempt,
+                "trace_id": trace_id,
+            }
+        )
         # Kafka key: the patient, so one patient's messages stay in order. A document with no patient yet
         # (a public dataset, an unassigned upload) has no ordering need, so its hash spreads the load.
         partition_key = stamped.source_patient_id or sha
@@ -308,17 +489,21 @@ class IngestBridge:
                 self.topic,
                 partition_key,
                 stamped.model_dump(mode="json"),
-                idempotency_key=ingest_id,
+                message_id=ingest_id,
             )
         except PublishError as exc:
             self.receipts.set_status(
-                ingest_id, ReceiptStatus.PUBLISH_FAILED, detail=str(exc)
+                ingest_id,
+                ReceiptStatus.PUBLISH_FAILED,
+                tenant_id=tenant,
+                detail=str(exc),
             )
             raise
-        if not self.receipts.set_status(ingest_id, ReceiptStatus.PUBLISHED):
-            # Another run retried the same pending receipt and finished first (the outbox appended
-            # the message once): for this run the item is a duplicate.
-            return IngestResult(Outcome.DUPLICATE, ingest_id, sha, key)
+        # This run's message is durable: the item is published, for this run, whatever the update
+        # below says. It says False when another run retried the same open receipt and recorded
+        # its own publish first: both appended (the id is on raw_data twice, at-least-once, and the
+        # consumer drops the repeat), and each run counts the message it made durable.
+        self.receipts.set_status(ingest_id, ReceiptStatus.PUBLISHED, tenant_id=tenant)
         return IngestResult(Outcome.PUBLISHED, ingest_id, sha, key, new_object)
 
     def _lost_race(

@@ -14,6 +14,7 @@ import pytest
 
 from src.config import APP_DIR
 from src.db import outbox as outbox_module
+from src.db import receipts as receipts_module
 from src.db.file_store import LocalFileStore, local
 from src.db.jobs import Job, JobStatus, JobStore
 from src.db.layout import DataLayout
@@ -233,13 +234,15 @@ def test_a_write_failure_is_a_publish_error_that_names_no_path(tmp_path, records
     cause = type(caught.value.__cause__).__name__
     assert str(caught.value) == f"could not append to the raw_data outbox: {cause}"
     assert blocker.name not in str(caught.value)
-    # (The OS quotes the path with repr, so on Windows its backslashes come doubled: the name.)
-    assert [blocker.name in r.getMessage() for r in records] == [True]
+    # Nor the log: the error's type and the OS's reason, never the path the OS message quotes.
+    [logged] = [r.getMessage() for r in records]
+    assert logged.startswith(f"could not append to the raw_data outbox: {cause} (")
+    assert blocker.name not in logged and str(tmp_path) not in logged
 
 
 def test_the_bytes_on_disk_are_the_same_on_every_os(tmp_path):
     outbox = JsonlOutbox(tmp_path)
-    outbox.publish("raw_data", "k", {"n": 1}, idempotency_key="m-1")
+    outbox.publish("raw_data", "k", {"n": 1}, message_id="m-1")
     outbox.publish("raw_data", "k", {"n": 2})
     assert (tmp_path / "raw_data.jsonl").read_bytes() == (
         b'{"topic":"raw_data","key":"k","id":"m-1","value":{"n":1}}\n'
@@ -252,7 +255,9 @@ def test_each_append_holds_the_topic_lock_around_the_check_the_write_and_the_fsy
 ):
     events = []
     real_fsync = os.fsync
-    monkeypatch.setattr(outbox_module, "_LOCK", lambda fd: events.append("lock"))
+    monkeypatch.setattr(
+        outbox_module, "_TRY_LOCK", lambda fd: events.append("lock") or True
+    )
     monkeypatch.setattr(outbox_module, "_UNLOCK", lambda fd: events.append("unlock"))
     monkeypatch.setattr(
         outbox_module, "_torn_tail", lambda path: events.append("tail check") or False
@@ -268,62 +273,205 @@ def test_each_append_holds_the_topic_lock_around_the_check_the_write_and_the_fsy
     assert (tmp_path / "raw_data.jsonl.lock").is_file()
 
 
-def test_the_lock_is_flock_on_posix_and_msvcrt_locking_on_windows(monkeypatch):
-    """Both sides run here, whatever the OS: the modules are injected."""
+def test_the_lock_is_a_non_blocking_flock_on_posix_and_msvcrt_locking_on_windows(
+    monkeypatch,
+):
+    """Both sides run here, whatever the OS: the modules are injected. Neither takes the lock
+    blocking: a busy lock answers False at once, and ``_acquire`` tries again under a deadline.
+    """
     calls = []
-    posix = types.SimpleNamespace(
-        LOCK_EX=2, LOCK_UN=8, flock=lambda fd, op: calls.append(("flock", fd, op))
-    )
+    busy = [True, True]  # the first two tries find another holder
+
+    def flock(fd, op):
+        calls.append(("flock", fd, op))
+        if op != 8 and busy:
+            busy.pop()
+            raise BlockingIOError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
+
+    posix = types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, flock=flock)
     monkeypatch.setitem(sys.modules, "fcntl", posix)
-    lock, unlock = outbox_module._lock_functions()
-    lock(7)
+    try_lock, unlock = outbox_module._lock_functions()
+    assert [try_lock(7), try_lock(7), try_lock(7)] == [False, False, True]
     unlock(7)
-    assert calls == [("flock", 7, 2), ("flock", 7, 8)]  # LOCK_EX blocks until held
+    assert calls == [("flock", 7, 2 | 4)] * 3 + [("flock", 7, 8)]  # LOCK_EX | LOCK_NB
 
     calls.clear()
-    busy = [None, None]  # the first two tries find the byte locked by another process
+    busy[:] = [True, True]
 
     def locking(fd, mode, nbytes):
         calls.append(("locking", fd, mode, nbytes))
         if mode == 2 and busy:  # LK_NBLCK: refused at once, not after a second's sleep
             busy.pop()
-            raise OSError(13, "Permission denied")
+            raise OSError(errno.EACCES, "Permission denied")
 
     windows = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking)
     monkeypatch.setitem(sys.modules, "fcntl", None)  # no fcntl: Windows
     monkeypatch.setitem(sys.modules, "msvcrt", windows)
-    monkeypatch.setattr(outbox_module, "_LOCK_RETRY_S", 0)
-    lock, unlock = outbox_module._lock_functions()
-    lock(7)
+    try_lock, unlock = outbox_module._lock_functions()
+    assert [try_lock(7), try_lock(7), try_lock(7)] == [False, False, True]
     unlock(7)
     assert calls == [("locking", 7, 2, 1)] * 3 + [("locking", 7, 0, 1)]
 
 
-def test_a_lock_that_cannot_be_taken_is_a_publish_error_not_a_hang(
-    tmp_path, monkeypatch
+def _posix(flock):
+    return {
+        "fcntl": types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4, LOCK_UN=8, flock=flock)
+    }
+
+
+def _windows(locking):
+    return {
+        "fcntl": None,
+        "msvcrt": types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking),
+    }
+
+
+def _busy_posix(fd, op):
+    raise BlockingIOError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
+
+
+def _busy_windows(fd, mode, nbytes):
+    raise OSError(errno.EACCES, "Permission denied")
+
+
+@pytest.mark.parametrize(
+    "modules", [_posix(_busy_posix), _windows(_busy_windows)], ids=["posix", "windows"]
+)
+def test_a_lock_held_past_the_deadline_fails_the_publish_on_both_os_paths(
+    tmp_path, monkeypatch, records, modules
 ):
-    """Windows: only a locking violation (another process holds the byte) is waited out. Any
-    other failure, a bad descriptor or a file system without byte-range locks, never clears: it
-    is raised at once and the publish fails as a PublishError, instead of the job thread polling
-    the lock for ever with nothing appended and nothing reported.
+    """The review's probe: a stalled holder (a stopped CLI, an fsync stuck on a network volume)
+    made the publish wait for the whole hold, flock(LOCK_EX) with no limit and the Windows path
+    polling for ever. Past LOCK_TIMEOUT_S the publish fails, content-free, and appends nothing.
     """
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    try_lock, _unlock = outbox_module._lock_functions()
+    monkeypatch.setattr(outbox_module, "_TRY_LOCK", try_lock)
+    monkeypatch.setattr(outbox_module, "LOCK_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(outbox_module, "_LOCK_RETRY_S", 0.001)
+    started = time.monotonic()
+    with pytest.raises(PublishError) as caught:
+        JsonlOutbox(tmp_path).publish("raw_data", "k", {"n": 1})
+    assert time.monotonic() - started < 5
+    assert str(caught.value) == "could not append to the raw_data outbox: TimeoutError"
+    assert not (tmp_path / "raw_data.jsonl").exists()
+    assert [r.getMessage() for r in records] == [
+        "could not append to the raw_data outbox: TimeoutError (no OS reason)"
+    ]
+
+
+def test_a_busy_lock_is_waited_out_within_the_deadline(monkeypatch):
     tries = []
 
+    def try_lock(fd):
+        tries.append(fd)
+        return len(tries) == 3  # another holder lets go at the third try
+
+    monkeypatch.setattr(outbox_module, "_TRY_LOCK", try_lock)
+    monkeypatch.setattr(outbox_module, "_LOCK_RETRY_S", 0)
+    outbox_module._acquire(7)
+    assert tries == [7, 7, 7]
+
+
+def _hold(path):
+    """Take the outbox lock as another holder would, with the OS's own lock (not the module's)."""
+    handle = path.open("ab")
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return handle
+
+
+def _release(handle):
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    handle.close()  # closing releases a flock
+
+
+def test_a_real_holder_that_stalls_fails_the_publish_after_the_deadline_not_a_hang(
+    tmp_path, monkeypatch
+):
+    """The real OS lock, held by another open handle of the lock file (as another process would
+    hold it): the publish gives up at the deadline instead of waiting for the holder."""
+    monkeypatch.setattr(outbox_module, "LOCK_TIMEOUT_S", 0.3, raising=False)
+    outcome = []
+
+    def publish():
+        try:
+            JsonlOutbox(tmp_path).publish("raw_data", "k", {"n": 1})
+            outcome.append("published")
+        except PublishError as exc:
+            outcome.append(str(exc))
+
+    holder = _hold(tmp_path / "raw_data.jsonl.lock")
+    thread = threading.Thread(target=publish, daemon=True)
+    try:
+        started = time.monotonic()
+        thread.start()
+        thread.join(10)
+        waited = time.monotonic() - started
+        assert not thread.is_alive(), "the publish waited for the lock with no limit"
+    finally:
+        _release(holder)
+        thread.join(10)
+    assert outcome == ["could not append to the raw_data outbox: TimeoutError"]
+    assert 0.3 <= waited < 5
+    assert not (tmp_path / "raw_data.jsonl").exists()
+    # The holder gone, the next publish goes through.
+    JsonlOutbox(tmp_path).publish("raw_data", "k", {"n": 2})
+    assert [row["value"] for row in JsonlOutbox(tmp_path).read("raw_data")] == [
+        {"n": 2}
+    ]
+
+
+def _bad_descriptor_windows(tries):
     def locking(fd, mode, nbytes):
         tries.append(mode)
         if len(tries) > 20:
             raise RuntimeError("still polling: the lock loop never gives up")
         raise OSError(errno.EBADF, "Bad file descriptor")
 
-    windows = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking)
-    monkeypatch.setitem(sys.modules, "fcntl", None)
-    monkeypatch.setitem(sys.modules, "msvcrt", windows)
+    return _windows(locking)
+
+
+def _bad_descriptor_posix(tries):
+    def flock(fd, op):
+        tries.append(op)
+        if len(tries) > 20:
+            raise RuntimeError("still polling: the lock loop never gives up")
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    return _posix(flock)
+
+
+@pytest.mark.parametrize(
+    "fake", [_bad_descriptor_windows, _bad_descriptor_posix], ids=["windows", "posix"]
+)
+def test_a_lock_that_cannot_be_taken_is_a_publish_error_not_a_hang(
+    tmp_path, monkeypatch, fake
+):
+    """Only another holder (a locking violation, EWOULDBLOCK) is waited out. Any other failure, a
+    bad descriptor or a file system without locks, never clears: it is raised at once and the
+    publish fails as a PublishError, instead of the job thread polling the lock until the deadline
+    with nothing appended and nothing reported.
+    """
+    tries = []
+    for name, module in fake(tries).items():
+        monkeypatch.setitem(sys.modules, name, module)
+    try_lock, _unlock = outbox_module._lock_functions()
+    monkeypatch.setattr(outbox_module, "_TRY_LOCK", try_lock)
     monkeypatch.setattr(outbox_module, "_LOCK_RETRY_S", 0)
-    lock, _unlock = outbox_module._lock_functions()
-    monkeypatch.setattr(outbox_module, "_LOCK", lock)
-    with pytest.raises(PublishError, match="raw_data outbox"):
+    with pytest.raises(PublishError, match="raw_data outbox: OSError"):
         JsonlOutbox(tmp_path).publish("raw_data", "k", {"n": 1})
-    assert tries == [2]  # raised on the first try, not retried
+    assert len(tries) == 1  # raised on the first try, not retried
     assert not (tmp_path / "raw_data.jsonl").exists()  # nothing was appended
 
 
@@ -334,7 +482,7 @@ from src.db.outbox import JsonlOutbox
 directory, worker, count = Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
 outbox = JsonlOutbox(directory)
 for n in range(count):
-    outbox.publish("raw_data", worker, {"n": n}, idempotency_key=f"{worker}-{n}")
+    outbox.publish("raw_data", worker, {"n": n}, message_id=f"{worker}-{n}")
 """
 
 
@@ -402,22 +550,32 @@ def test_one_receipt_per_tenant_source_message_and_hash(receipts):
 
 def test_status_moves_on_and_unknown_ids_fail(receipts):
     receipts.add(_receipt())
-    receipts.set_status("i1", ReceiptStatus.PUBLISH_FAILED, detail="broker down")
+    receipts.set_status(
+        "i1", ReceiptStatus.PUBLISH_FAILED, tenant_id=TENANT, detail="broker down"
+    )
     moved = receipts.get("i1", tenant_id=TENANT)
     assert (moved.status, moved.detail) == (ReceiptStatus.PUBLISH_FAILED, "broker down")
     with pytest.raises(KeyError):
-        receipts.set_status("missing", ReceiptStatus.PUBLISHED)
+        receipts.set_status("missing", ReceiptStatus.PUBLISHED, tenant_id=TENANT)
 
 
-def test_the_envelope_is_written_with_the_receipt_and_kept_across_updates(receipts):
+def test_the_envelope_is_written_with_the_receipt_and_never_replaced(receipts):
     receipts.add(dataclasses.replace(_receipt(), envelope='{"as": "first built"}'))
     assert receipts.get("i1", tenant_id=TENANT).envelope == '{"as": "first built"}'
-    # A status update without an envelope keeps it; one with a new envelope replaces it.
-    receipts.set_status("i1", ReceiptStatus.PUBLISH_FAILED, detail="broker down")
+    # A status update without an envelope keeps it.
+    receipts.set_status(
+        "i1", ReceiptStatus.PUBLISH_FAILED, tenant_id=TENANT, detail="broker down"
+    )
     assert receipts.get("i1", tenant_id=TENANT).envelope == '{"as": "first built"}'
-    receipts.set_status("i1", ReceiptStatus.RECEIVED, envelope='{"as": "rebuilt"}')
-    assert receipts.get("i1", tenant_id=TENANT).envelope == '{"as": "rebuilt"}'
-    assert receipts.find(TENANT, "s", "m", "ab" * 32).envelope == '{"as": "rebuilt"}'
+    # A later write never replaces it either: the envelope stays the one first built (the review's
+    # probe: a re-pull overwrote it, with another source_meta and connector_version).
+    receipts.set_status(
+        "i1", ReceiptStatus.RECEIVED, tenant_id=TENANT, envelope='{"as": "rebuilt"}'
+    )
+    assert receipts.get("i1", tenant_id=TENANT).envelope == '{"as": "first built"}'
+    assert (
+        receipts.find(TENANT, "s", "m", "ab" * 32).envelope == '{"as": "first built"}'
+    )
 
 
 def test_counts_and_recent_per_source(receipts):
@@ -430,7 +588,7 @@ def test_counts_and_recent_per_source(receipts):
     assert [r.source for r in receipts.recent("b", limit=5, tenant_id=TENANT)] == ["b"]
 
 
-def test_recent_filters_by_status_and_with_status_is_oldest_first(receipts):
+def test_recent_filters_by_status_and_in_status_is_oldest_first(receipts):
     receipts.add(_receipt("i1", "a", "m1", ReceiptStatus.PUBLISHED))
     receipts.add(_receipt("i2", "a", "m2", ReceiptStatus.REJECTED))
     receipts.add(_receipt("i3", "b", "m3", ReceiptStatus.PUBLISHED))
@@ -442,27 +600,28 @@ def test_recent_filters_by_status_and_with_status_is_oldest_first(receipts):
     ] == ["i1"]
     assert [
         r.ingest_id
-        for r in receipts.with_status(ReceiptStatus.PUBLISHED, tenant_id=TENANT)
-    ] == [
-        "i1",
-        "i3",
-    ]
+        for r in receipts.in_status(
+            ReceiptStatus.PUBLISHED, {"a", "b"}, tenant_id=TENANT
+        )
+    ] == ["i1", "i3"]
     assert [
         r.ingest_id
-        for r in receipts.with_status(ReceiptStatus.PUBLISHED, "b", tenant_id=TENANT)
+        for r in receipts.in_status(ReceiptStatus.PUBLISHED, {"b"}, tenant_id=TENANT)
     ] == ["i3"]
 
 
 def test_a_publish_attempt_is_counted_on_open_receipts_only(receipts):
     receipts.add(_receipt("i1"))
     receipts.add(_receipt("i2", "s", "m2", ReceiptStatus.PUBLISHED))
-    assert receipts.begin_attempt("i1") == 1
-    assert receipts.begin_attempt("i1") == 2
+    assert receipts.begin_attempt("i1", tenant_id=TENANT) == 1
+    assert receipts.begin_attempt("i1", tenant_id=TENANT) == 2
     assert receipts.get("i1", tenant_id=TENANT).attempts == 2
-    assert receipts.begin_attempt("i2") is None  # final: nothing left to publish
+    assert (
+        receipts.begin_attempt("i2", tenant_id=TENANT) is None
+    )  # final: nothing left to publish
     assert receipts.get("i2", tenant_id=TENANT).attempts == 0
     with pytest.raises(KeyError):
-        receipts.begin_attempt("missing")
+        receipts.begin_attempt("missing", tenant_id=TENANT)
 
 
 def test_receipt_files_from_before_the_attempt_count_and_the_envelope_are_extended(
@@ -485,8 +644,10 @@ def test_receipt_files_from_before_the_attempt_count_and_the_envelope_are_extend
     with ReceiptStore(path) as receipts:
         old = receipts.get("i-old", tenant_id=TENANT)
         assert (old.attempts, old.envelope) == (0, None)  # no envelope to republish
-        assert receipts.begin_attempt("i-old") == 1
-        assert receipts.set_status("i-old", ReceiptStatus.RECEIVED, envelope="{}")
+        assert receipts.begin_attempt("i-old", tenant_id=TENANT) == 1
+        assert receipts.set_status(
+            "i-old", ReceiptStatus.RECEIVED, tenant_id=TENANT, envelope="{}"
+        )
     with ReceiptStore(
         path
     ) as receipts:  # opened again: the columns are not added twice
@@ -629,9 +790,9 @@ def test_a_repeat_is_appended_again_under_the_same_id(tmp_path):
     """
     outbox = JsonlOutbox(tmp_path)
     outbox.publish("raw_data", "k", {"n": 0})  # no key
-    outbox.publish("raw_data", "k", {"n": 1}, idempotency_key="m-1")
-    outbox.publish("raw_data", "k", {"n": 1}, idempotency_key="m-1")  # a retry
-    outbox.publish("raw_data", "k", {"n": 2}, idempotency_key="m-2")
+    outbox.publish("raw_data", "k", {"n": 1}, message_id="m-1")
+    outbox.publish("raw_data", "k", {"n": 1}, message_id="m-1")  # a retry
+    outbox.publish("raw_data", "k", {"n": 2}, message_id="m-2")
     rows = JsonlOutbox(tmp_path).read("raw_data")  # another process reads the same
     assert [(row.get("id"), row["value"]["n"]) for row in rows] == [
         (None, 0),
@@ -646,14 +807,14 @@ def test_a_torn_line_left_by_a_crashed_writer_does_not_swallow_the_next_message(
     tmp_path, records
 ):
     outbox = JsonlOutbox(tmp_path)
-    outbox.publish("raw_data", "k", {"n": 1}, idempotency_key="m-1")
+    outbox.publish("raw_data", "k", {"n": 1}, message_id="m-1")
     path = tmp_path / "raw_data.jsonl"
     with path.open("ab") as handle:  # the disk filled, or the power went, mid-line
         handle.write(b'{"topic":"raw_data","key":"k","id":"m-torn"')
     # The torn line was never acknowledged (its publish raised), so its receipt is still open and it
     # comes back under the same id. The message published after it must not be glued to it: it is
     # durable, so it must be readable, here and by another process.
-    outbox.publish("raw_data", "k", {"n": 2}, idempotency_key="m-2")
+    outbox.publish("raw_data", "k", {"n": 2}, message_id="m-2")
     with path.open("ab") as handle:
         handle.write(b"\n")  # a blank line is nothing
     assert [row["id"] for row in outbox.read("raw_data")] == ["m-1", "m-2"]
@@ -671,8 +832,10 @@ def test_terminal_receipts_do_not_move(receipts):
     receipts.add(_receipt("i3", "s", "m3", ReceiptStatus.TOO_LARGE))
     receipts.add(_receipt("i4", "s", "m4", ReceiptStatus.PUBLISH_FAILED))
     # published and rejected are final here: a late or stale update is refused, quietly
-    assert not receipts.set_status("i1", ReceiptStatus.PUBLISH_FAILED, detail="late")
-    assert not receipts.set_status("i2", ReceiptStatus.PUBLISHED)
+    assert not receipts.set_status(
+        "i1", ReceiptStatus.PUBLISH_FAILED, tenant_id=TENANT, detail="late"
+    )
+    assert not receipts.set_status("i2", ReceiptStatus.PUBLISHED, tenant_id=TENANT)
     assert (
         receipts.get("i1", tenant_id=TENANT).status,
         receipts.get("i1", tenant_id=TENANT).detail,
@@ -682,11 +845,13 @@ def test_terminal_receipts_do_not_move(receipts):
     )
     assert receipts.get("i2", tenant_id=TENANT).status is ReceiptStatus.REJECTED
     # a size reject is retried once the cap is raised; a failed publish is retried
-    assert receipts.set_status("i3", ReceiptStatus.PUBLISHED)
-    assert receipts.set_status("i4", ReceiptStatus.REJECTED, detail="not a pdf now")
+    assert receipts.set_status("i3", ReceiptStatus.PUBLISHED, tenant_id=TENANT)
+    assert receipts.set_status(
+        "i4", ReceiptStatus.REJECTED, tenant_id=TENANT, detail="not a pdf now"
+    )
     assert receipts.get("i3", tenant_id=TENANT).status is ReceiptStatus.PUBLISHED
     assert receipts.get("i4", tenant_id=TENANT).status is ReceiptStatus.REJECTED
-    assert not receipts.set_status("i4", ReceiptStatus.PUBLISHED)
+    assert not receipts.set_status("i4", ReceiptStatus.PUBLISHED, tenant_id=TENANT)
 
 
 def test_receipts_are_read_per_tenant(receipts):
@@ -727,12 +892,15 @@ def test_receipts_are_read_per_tenant(receipts):
     ] == ["i2"]
     assert [
         r.ingest_id
-        for r in receipts.with_status(ReceiptStatus.PUBLISHED, tenant_id=TENANT)
+        for r in receipts.in_status(ReceiptStatus.PUBLISHED, {"a"}, tenant_id=TENANT)
     ] == ["i1"]
     assert [
         r.ingest_id
-        for r in receipts.with_status(ReceiptStatus.PUBLISHED, "a", tenant_id=other)
+        for r in receipts.in_status(ReceiptStatus.PUBLISHED, {"a"}, tenant_id=other)
     ] == ["i2"]
+    assert receipts.counts_by_source([ReceiptStatus.PUBLISHED], tenant_id=other) == {
+        (ReceiptStatus.PUBLISHED, "a"): 1
+    }
     # A tenant never sees another's rows, and there is no read that spans tenants.
     assert receipts.counts(tenant_id=TENANT) == {"published": 1}
     assert receipts.get("i1", tenant_id=other) is None
@@ -745,7 +913,8 @@ def test_receipts_are_read_per_tenant(receipts):
         lambda receipts: receipts.get("i1"),
         lambda receipts: receipts.counts(),
         lambda receipts: receipts.recent(),
-        lambda receipts: receipts.with_status(ReceiptStatus.PUBLISHED),
+        lambda receipts: receipts.in_status(ReceiptStatus.PUBLISHED, {"s"}),
+        lambda receipts: receipts.counts_by_source([ReceiptStatus.PUBLISHED]),
     ],
 )
 def test_every_read_names_a_tenant(receipts, read):
@@ -755,6 +924,44 @@ def test_every_read_names_a_tenant(receipts, read):
     receipts.add(_receipt("i1", status=ReceiptStatus.PUBLISHED))
     with pytest.raises(TypeError, match="tenant_id"):
         read(receipts)
+
+
+def test_a_write_names_the_tenant_and_never_touches_another_tenants_receipt(receipts):
+    """A write filters on the tenant as well as the ingest id: one tenant's status update or
+    attempt count cannot move another tenant's receipt, even given its ingest id."""
+    other = "0192a3b4-0000-7000-8000-000000000002"
+    receipts.add(dataclasses.replace(_receipt("i-theirs"), tenant_id=other))
+    with pytest.raises(KeyError):
+        receipts.set_status("i-theirs", ReceiptStatus.PUBLISHED, tenant_id=TENANT)
+    with pytest.raises(KeyError):
+        receipts.begin_attempt("i-theirs", tenant_id=TENANT)
+    theirs = receipts.get("i-theirs", tenant_id=other)
+    assert (theirs.status, theirs.attempts) == (ReceiptStatus.RECEIVED, 0)
+    # The owner's writes land.
+    assert receipts.begin_attempt("i-theirs", tenant_id=other) == 1
+    assert receipts.set_status("i-theirs", ReceiptStatus.PUBLISHED, tenant_id=other)
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda receipts: receipts.set_status("i1", ReceiptStatus.PUBLISHED),
+        lambda receipts: receipts.begin_attempt("i1"),
+    ],
+)
+def test_every_write_names_a_tenant(receipts, write):
+    receipts.add(_receipt("i1"))
+    with pytest.raises(TypeError, match="tenant_id"):
+        write(receipts)
+
+
+def test_the_job_records_run_under_the_receipts_connection_policy(tmp_path):
+    """One helper opens both files (src.db.sqlite): the job records get WAL and the busy timeout
+    too, instead of the rollback journal and an immediate "database is locked"."""
+    store = JobStore(tmp_path / "jobs.sqlite")
+    with store._connect() as db:
+        assert db.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        assert db.execute("PRAGMA busy_timeout").fetchone() == (5000,)
 
 
 def test_the_receipts_file_is_shared_safely(tmp_path):
@@ -768,17 +975,115 @@ def test_the_receipts_file_is_shared_safely(tmp_path):
         columns = [
             row[2]
             for row in db.execute(
-                "PRAGMA index_info(ix_ingest_receipts_status_source_received)"
+                "PRAGMA index_info(ix_ingest_receipts_tenant_status_received)"
             )
         ]
-        assert "ix_ingest_receipts_status_source_received" in indexes
-        assert columns == ["status", "source", "received_at"]
+        assert "ix_ingest_receipts_tenant_status_received" in indexes
+        assert columns == ["tenant_id", "status", "received_at"]
+        assert "ix_ingest_receipts_status_source_received" not in indexes
 
 
 def test_a_held_receipt_is_open(receipts):
     receipts.add(_receipt("i1", status=ReceiptStatus.HELD))
-    assert receipts.set_status("i1", ReceiptStatus.PUBLISHED)
+    assert receipts.set_status("i1", ReceiptStatus.PUBLISHED, tenant_id=TENANT)
     assert receipts.get("i1", tenant_id=TENANT).status is ReceiptStatus.PUBLISHED
     assert not receipts.set_status(
-        "i1", ReceiptStatus.HELD
+        "i1", ReceiptStatus.HELD, tenant_id=TENANT
     )  # never back from published
+
+
+# ── Paging through receipts ──────────────────────────────────────────────────
+def test_a_page_is_an_index_range_scan_in_received_order(receipts):
+    """The relay's page query seeks the (tenant_id, status, received_at) index from the cursor and
+    reads it in order, so it stops at its LIMIT: no temp B-tree sort, no scan of the whole table.
+    """
+    plan = " | ".join(
+        row[3]
+        for row in receipts._db.execute(
+            "EXPLAIN QUERY PLAN " + receipts_module._PAGE,
+            (TENANT, "held", '["s"]', "", "", 0, 2),
+        )
+    )
+    assert "USING INDEX ix_ingest_receipts_tenant_status_received" in plan
+    assert "received_at>?" in plan  # the cursor is a seek, not a filter
+    assert "TEMP B-TREE" not in plan
+
+
+def test_in_status_reads_a_page_at_a_time_in_order_and_only_the_given_sources(
+    receipts, monkeypatch
+):
+    """Keyset pages on (received_at, rowid): receipts with the same timestamp come in insertion
+    order across page boundaries, none twice and none skipped, and another source's receipts
+    are filtered out by the query."""
+    monkeypatch.setattr(receipts_module, "PAGE_SIZE", 2)
+    for n in range(5):  # all at one timestamp: the rowid settles the order
+        receipts.add(_receipt(f"a{n}", "a", f"m{n}"))
+        receipts.add(_receipt(f"b{n}", "b", f"m{n}"))
+    receipts.add(
+        dataclasses.replace(
+            _receipt("a-late", "a", "m-late"), received_at="2026-09-23T00:00:00+00:00"
+        )
+    )
+    pages = []
+    real_execute = receipts._db.execute
+
+    class Spy:
+        def execute(self, sql, params=()):
+            cursor = real_execute(sql, params)
+            if sql is receipts_module._PAGE:
+                rows = cursor.fetchall()
+                pages.append([row[0] for row in rows])
+                return FakeCursor(rows)
+            return cursor
+
+    class FakeCursor:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+    monkeypatch.setattr(receipts, "_db", Spy())
+    listed = [
+        r.ingest_id
+        for r in receipts.in_status(ReceiptStatus.RECEIVED, {"a"}, tenant_id=TENANT)
+    ]
+    assert listed == ["a0", "a1", "a2", "a3", "a4", "a-late"]
+    assert pages == [["a0", "a1"], ["a2", "a3"], ["a4", "a-late"], []]
+    assert (
+        list(receipts.in_status(ReceiptStatus.RECEIVED, set(), tenant_id=TENANT)) == []
+    )
+
+
+def test_counts_by_source_count_in_the_database(receipts):
+    receipts.add(_receipt("i1", "a", "m1"))
+    receipts.add(_receipt("i2", "a", "m2", ReceiptStatus.HELD))
+    receipts.add(_receipt("i3", "b", "m3", ReceiptStatus.HELD))
+    receipts.add(_receipt("i4", "b", "m4", ReceiptStatus.PUBLISHED))
+    wanted = [ReceiptStatus.RECEIVED, ReceiptStatus.HELD]
+    assert receipts.counts_by_source(wanted, tenant_id=TENANT) == {
+        (ReceiptStatus.RECEIVED, "a"): 1,
+        (ReceiptStatus.HELD, "a"): 1,
+        (ReceiptStatus.HELD, "b"): 1,
+    }
+    assert receipts.counts_by_source(wanted, "b", tenant_id=TENANT) == {
+        (ReceiptStatus.HELD, "b"): 1
+    }
+
+
+def test_a_receipts_file_from_before_gets_the_new_index_and_loses_the_old(tmp_path):
+    path = tmp_path / "receipts.sqlite"
+    with ReceiptStore(path):
+        pass
+    with sqlite3.connect(path) as db:
+        db.execute("DROP INDEX ix_ingest_receipts_tenant_status_received")
+        db.execute(
+            "CREATE INDEX ix_ingest_receipts_status_source_received "
+            "ON ingest_receipts (status, source, received_at)"
+        )
+    with ReceiptStore(path) as receipts:
+        names = {
+            row[1] for row in receipts._db.execute("PRAGMA index_list(ingest_receipts)")
+        }
+    assert "ix_ingest_receipts_tenant_status_received" in names
+    assert "ix_ingest_receipts_status_source_received" not in names

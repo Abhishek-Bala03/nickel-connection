@@ -31,7 +31,10 @@ class RepublishJobRequest(BaseModel):
         description="Only this source's receipts (a manifest id); every source otherwise.",
     )
     limit: int | None = Field(
-        default=None, ge=1, description="Publish at most this many receipts."
+        default=None,
+        ge=1,
+        description="Take up at most this many receipts: published, found published "
+        "already, set aside, or without an envelope.",
     )
 
 

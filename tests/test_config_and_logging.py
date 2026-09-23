@@ -1,5 +1,6 @@
 """Settings come from the shipped conf/application.conf and the environment; the logger writes once."""
 
+import dataclasses
 import logging
 import re
 from pathlib import Path
@@ -7,15 +8,18 @@ from uuid import UUID
 
 import pytest
 
+import main
 from src import __version__
 from src.config import CONF_FILE, DEFAULT_MAX_FILE_BYTES, MANIFEST_DIR, load_settings
-from src.logging import LOG_FORMAT, build_logger
+from src.logging import LOG_FORMAT, LOGGER_NAME, build_logger, logger
 
 TENANT = "0192a3b4-0000-7000-8000-000000000001"
+TOKEN = "config-test-token-0123456789abcdef0123456789abcdef"
 EVERY_VARIABLE = {
     "NICKEL_ENV": "qa",
     "NICKEL_LOG_LEVEL": "debug",
     "NICKEL_CORS_ORIGINS": "http://a.example, http://b.example ,",
+    "NICKEL_SERVICE_TOKEN": TOKEN,
     "APP_VERSION": "1.4.0",
     "NICKEL_TENANT_ID": TENANT,
     "NICKEL_MAX_FILE_BYTES": "123",
@@ -28,10 +32,12 @@ EVERY_VARIABLE = {
 def test_the_shipped_configuration_falls_back_to_the_defaults():
     settings = load_settings(CONF_FILE, environ={})
     assert settings.name == "nickel-connection"
-    assert settings.environment == "development"
+    # production unless set: a deployment that forgets NICKEL_ENV gets the API docs off.
+    assert settings.environment == "production"
     assert settings.version == __version__
     assert settings.log_level == "INFO"
     assert settings.cors_origins == ()
+    assert settings.service_token == ""  # main.create_app refuses to start on it
     assert settings.tenant_id is None
     assert settings.max_file_bytes == DEFAULT_MAX_FILE_BYTES == 100 * 1024 * 1024
     assert settings.manifest_dir == MANIFEST_DIR
@@ -44,6 +50,7 @@ def test_the_shipped_configuration_reads_every_variable():
     assert settings.environment == "qa"
     assert settings.log_level == "DEBUG"
     assert settings.cors_origins == ("http://a.example", "http://b.example")
+    assert settings.service_token == TOKEN
     assert settings.version == "1.4.0"
     assert settings.tenant_id == UUID(TENANT)
     assert settings.max_file_bytes == 123
@@ -53,11 +60,39 @@ def test_the_shipped_configuration_reads_every_variable():
 
 
 def test_the_shipped_configuration_names_no_other_variables():
-    # Every ${VAR} the file reads is set above, so a setting added without a test, or one left
-    # behind by a removed feature, shows up here.
+    # Every ${VAR} the file reads is set above (the token file apart, tested on its own), so a
+    # setting added without a test, or one left behind by a removed feature, shows up here.
     text = CONF_FILE.read_text(encoding="utf-8")
     named = set(re.findall(r"^\w+ = \$\{(\w+)\}$", text, flags=re.MULTILINE))
-    assert named == set(EVERY_VARIABLE) - {"APP_VERSION"}
+    expected = (set(EVERY_VARIABLE) - {"APP_VERSION"}) | {"NICKEL_SERVICE_TOKEN_FILE"}
+    assert named == expected
+
+
+def test_the_service_token_can_come_from_a_mounted_secret_file(tmp_path):
+    secret = tmp_path / "nickel-service-token"
+    secret.write_text(f"  {TOKEN}\n", encoding="utf-8")  # a trailing newline is usual
+    environ = {"NICKEL_SERVICE_TOKEN_FILE": str(secret)}
+    assert load_settings(CONF_FILE, environ=environ).service_token == TOKEN
+
+
+def test_a_missing_token_file_is_refused_by_name(tmp_path):
+    environ = {"NICKEL_SERVICE_TOKEN_FILE": str(tmp_path / "nope")}
+    with pytest.raises(ValueError, match="NICKEL_SERVICE_TOKEN_FILE"):
+        load_settings(CONF_FILE, environ=environ)
+
+
+def test_a_token_both_in_the_environment_and_in_a_file_is_refused(tmp_path):
+    secret = tmp_path / "token"
+    secret.write_text("other", encoding="utf-8")
+    environ = {"NICKEL_SERVICE_TOKEN": TOKEN, "NICKEL_SERVICE_TOKEN_FILE": str(secret)}
+    with pytest.raises(ValueError, match="not both"):
+        load_settings(CONF_FILE, environ=environ)
+
+
+def test_the_settings_never_show_the_token():
+    settings = load_settings(CONF_FILE, environ={"NICKEL_SERVICE_TOKEN": TOKEN})
+    assert TOKEN not in repr(settings)
+    assert TOKEN not in str(settings)
 
 
 def test_values_in_the_file_win_over_the_defaults(tmp_path):
@@ -116,3 +151,26 @@ def test_the_logger_writes_to_stdout_once(capsys):
     assert log.handlers[0].formatter._fmt == LOG_FORMAT
     log.warning("hello")
     assert "WARNING [nickel-test] hello" in capsys.readouterr().out
+
+
+def test_there_is_no_settings_global():
+    """Importing src.config reads nothing: ``load_settings()`` reads the settings, and whoever
+    starts something passes them on (main's app, the command line's run, the handlers and the
+    connector: a connector without them is a TypeError, tests/test_connector.py)."""
+    import src.config
+
+    assert not hasattr(src.config, "Service")
+
+
+def test_the_app_sets_the_log_level_from_the_settings_it_is_given(settings):
+    """The logger is created at import under the service's name and reads no settings there;
+    the app's settings decide its level when the app is created."""
+    assert logger.name == LOGGER_NAME == "nickel-connection"
+    before = logger.level
+    try:
+        main.create_app(dataclasses.replace(settings, log_level="DEBUG"))
+        assert logger.level == logging.DEBUG
+        main.create_app(dataclasses.replace(settings, log_level="WARNING"))
+        assert logger.level == logging.WARNING
+    finally:
+        logger.setLevel(before)

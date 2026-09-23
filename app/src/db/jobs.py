@@ -1,7 +1,8 @@
 """Job records for the jobs API: what was queued, when it ran, and how it ended.
 
-SQLite under the data root. Every call opens its own short connection, so the API's request threads and
-the worker thread share the store safely. Counts and an error message only: never document content.
+SQLite under the data root, on the same connection policy as the receipts (``src.db.sqlite``: WAL
+and a busy timeout). Every call opens its own short connection, so the API's request threads and the
+worker thread share the store safely. Counts and an error message only: never document content.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from src.db.sqlite import connect
 
 
 class JobStatus(StrEnum):
@@ -113,7 +116,6 @@ def _to_job(row: tuple) -> Job:
 class JobStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.execute(_SCHEMA)
             columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
@@ -123,7 +125,7 @@ class JobStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path)
+        db = connect(self.path)
         try:
             with db:
                 yield db

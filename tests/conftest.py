@@ -1,3 +1,11 @@
+import os
+
+# The service does not start without its token (src.services.auth), and importing main starts it. Set
+# before the imports below, and forced rather than defaulted: the tests never depend on the shell.
+SERVICE_TOKEN = "test-service-token-0123456789abcdef0123456789abcdef"
+os.environ["NICKEL_SERVICE_TOKEN"] = SERVICE_TOKEN
+os.environ.pop("NICKEL_SERVICE_TOKEN_FILE", None)
+
 import dataclasses
 import logging
 import time
@@ -8,6 +16,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import main
+from src.config import load_settings
 from src.db.file_store import LocalFileStore
 from src.db.outbox import JsonlOutbox
 from src.db.receipts import ReceiptStore
@@ -116,10 +125,10 @@ def settings(tmp_path):
     """The service settings on temporary data: a tenant, an empty manifest folder, a fresh data dir."""
     manifests = tmp_path / "manifests"
     manifests.mkdir()
-    # A development deployment, as the tests' dev-phase manifests need; tests of production
-    # behaviour set the environment themselves.
+    # A development deployment, as the tests' dev-phase manifests need (production is the default and
+    # clears only prod manifests); tests of production behaviour set the environment themselves.
     return dataclasses.replace(
-        main.Service,
+        load_settings(),
         environment="development",
         data_dir=tmp_path / "data",
         manifest_dir=manifests,
@@ -130,11 +139,19 @@ def settings(tmp_path):
 @pytest.fixture
 def service(settings):
     """A TestClient factory for the real app on those settings: ``with service() as client:`` runs the
-    lifespan (the job worker) too. Overrides replace settings.
+    lifespan (the job worker) too. Overrides replace settings. The client sends the service token
+    (tests/test_auth.py covers going without). The worker's start-up republish is off unless a test
+    asks for it (``republish_at_start=True``), so the jobs a test sees are the ones it queued.
     """
 
-    def make(**overrides):
-        return TestClient(main.create_app(dataclasses.replace(settings, **overrides)))
+    def make(republish_at_start=False, **overrides):
+        return TestClient(
+            main.create_app(
+                dataclasses.replace(settings, **overrides),
+                republish_at_start=republish_at_start,
+            ),
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+        )
 
     return make
 

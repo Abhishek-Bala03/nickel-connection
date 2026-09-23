@@ -17,18 +17,25 @@ from pathlib import Path
 from uuid import UUID
 
 from src.config import ServiceSettings
-from src.connectors.documents import DocumentConnector, DocumentManifest, RunSummary
+from src.connectors.documents import (
+    DocumentConnector,
+    DocumentManifest,
+    ManifestError,
+    RunSummary,
+)
 from src.db.file_store import LocalFileStore
 from src.db.layout import DataLayout
 from src.db.outbox import JsonlOutbox, PublishError
 from src.db.receipts import Receipt, ReceiptStatus, ReceiptStore
 from src.error import NotFoundError, UnavailableError
 from src.handler.ingest import IngestBridge, Outcome
+from src.logging import logger
 from src.utility.ids import uuid7
 
 # What the relay takes up, in this order: received (a crash before the publish), publish_failed (a
-# broker that was down), and held (shadow mode), the last only once the source is enabled.
-# too_large receipts have no stored original (the edge check stops them before the File Store), so
+# broker that was down) and held (shadow mode). Each of them only while its source is enabled, the
+# rules a pull obeys: its manifest is found, cleared for this environment and out of shadow mode.
+# too_large receipts have no stored original (the size check stops them before the File Store), so
 # they wait for the source to list them again.
 _REPUBLISHABLE = (
     ReceiptStatus.RECEIVED,
@@ -96,17 +103,31 @@ class RepublishSummary:
 
     source: str | None
     trace_id: str
-    open_receipts: int = 0  # received, publish_failed and held receipts looked at
+    # The received, publish_failed and held receipts open when the run began (for its source, if it
+    # names one). The counts below say what became of them; with a limit or a publish failure the
+    # rest were not reached, and a receipt another run moved on meanwhile (a pull that published
+    # it) is counted open but not taken up.
+    open_receipts: int = 0
     published: int = 0
     duplicates: int = 0  # published by another run meanwhile
-    # Held receipts whose source is still in shadow mode, not cleared for this environment, or
-    # has no manifest any more: they wait.
+    # Open receipts of a source that is not enabled: no manifest any more, not cleared for this
+    # environment, back in shadow mode, or a manifest that cannot be read. Counted in the
+    # database, never loaded, never sent: they wait.
     held_back: int = 0
+    # Receipts whose stored envelope cannot go out (it does not validate, or is from a newer
+    # version than this service writes): set aside, the receipt says why, and the relay goes on.
+    # The next pull of the item publishes an envelope it builds again; the stored one stays.
+    bad_envelope: int = 0
     # Receipts from before the envelope was kept on them: they wait for the source to list the
-    # item again, which rebuilds the envelope. Counted, not guessed at.
+    # item again, whose pull builds one. Counted, not guessed at.
     no_envelope: int = 0
     # Content-free (what a job record keeps): why the run did not reach the end.
     error: str | None = None
+
+    @property
+    def taken(self) -> int:
+        """The receipts this run took up: what a limit bounds, whatever became of them."""
+        return self.published + self.duplicates + self.bad_envelope + self.no_envelope
 
     def counts(self) -> dict[str, int]:
         return {
@@ -114,6 +135,7 @@ class RepublishSummary:
             "published": self.published,
             "duplicates": self.duplicates,
             "held_back": self.held_back,
+            "bad_envelope": self.bad_envelope,
             "no_envelope": self.no_envelope,
         }
 
@@ -136,33 +158,70 @@ def republish_documents(
     trace_id: str | None = None,
 ) -> RepublishSummary:
     """Publish the tenant's open receipts again from the envelopes they store, without their
-    sources: ``received`` and ``publish_failed`` ones, and ``held`` ones once their manifest is
-    enabled (found, cleared for this environment and no longer in shadow mode). Oldest first, at
-    most ``limit`` of them; a publish failure stops the run, as it stops a pull.
+    sources: ``received``, ``publish_failed`` and ``held`` ones, each only while its source is
+    enabled (its manifest found, cleared for this environment and out of shadow mode, as a pull
+    requires). Oldest first within each status, at most ``limit`` of them taken up (published,
+    found published already, set aside or without an envelope); a publish failure stops the run,
+    as it stops a pull.
+
+    The open receipts are counted by source in the database first, and each source's manifest is
+    read once. The ones of a source that is not enabled are counted as held back without loading
+    a row; the others are read a page at a time (``ReceiptStore.in_status``), their source
+    filtered in the query, so memory holds one page however many are open. A stored envelope that
+    does not validate is set aside and counted, and the run goes on.
     """
     tenant = str(require_tenant(settings))
     summary = RepublishSummary(source=source, trace_id=trace_id or uuid7().hex)
-    enabled: dict[str, bool] = {}  # source -> whether its held items may go out
     with ingest_bridge(settings) as bridge:
+        waiting = bridge.receipts.counts_by_source(
+            _REPUBLISHABLE, source, tenant_id=tenant
+        )
+        enabled = _enabled_sources(settings, waiting, summary)
         for status in _REPUBLISHABLE:
-            for receipt in bridge.receipts.with_status(
-                status, source, tenant_id=tenant
+            # Nothing of an enabled source in this status: no query at all.
+            if any(waiting.get((status, name)) for name in enabled) and not _relay(
+                bridge, status, enabled=enabled, limit=limit, summary=summary
             ):
-                if (
-                    limit is not None
-                    and summary.published + summary.duplicates >= limit
-                ):
-                    return summary
-                summary.open_receipts += 1
-                if status is ReceiptStatus.HELD and not _source_enabled(
-                    settings, receipt.source, enabled
-                ):
-                    summary.held_back += 1
-                elif receipt.envelope is None:
-                    summary.no_envelope += 1
-                elif not _republish_one(bridge, receipt, summary):
-                    return summary
+                break
     return summary
+
+
+def _enabled_sources(
+    settings: ServiceSettings,
+    waiting: dict[tuple[ReceiptStatus, str], int],
+    summary: RepublishSummary,
+) -> set[str]:
+    """The sources whose open receipts may go out (each manifest read once). Every open receipt
+    is counted, and those of the other sources are counted as held back, none of them loaded.
+    """
+    sources = {name for _status, name in waiting.keys()}
+    enabled = {name for name in sources if _source_enabled(settings, name)}
+    for (_, name), count in waiting.items():
+        summary.open_receipts += count
+        if name not in enabled:
+            summary.held_back += count
+    return enabled
+
+
+def _relay(
+    bridge: IngestBridge,
+    status: ReceiptStatus,
+    *,
+    enabled: set[str],
+    limit: int | None,
+    summary: RepublishSummary,
+) -> bool:
+    """Republish the enabled sources' receipts in one status, oldest first, a page at a time.
+    False when the run stops here: the limit is reached, or a publish failed. The limit counts
+    every receipt taken up, set aside or without an envelope included, so one run examines at
+    most ``limit`` of them, however many stay open."""
+    tenant = str(bridge.tenant_id)
+    for receipt in bridge.receipts.in_status(status, enabled, tenant_id=tenant):
+        if limit is not None and summary.taken >= limit:
+            return False
+        if not _republish_one(bridge, receipt, summary):
+            return False
+    return True
 
 
 def _republish_one(
@@ -171,6 +230,9 @@ def _republish_one(
     """Republish one receipt and count the outcome. False stops the run: a publish failed, and
     nothing after it would be durable (the receipt says publish_failed, for the next run).
     """
+    if receipt.envelope is None:
+        summary.no_envelope += 1
+        return True
     try:
         result = bridge.republish(receipt, summary.trace_id)
     except PublishError:
@@ -178,27 +240,40 @@ def _republish_one(
         return False
     if result.outcome is Outcome.PUBLISHED:
         summary.published += 1
+    elif result.outcome is Outcome.BAD_ENVELOPE:
+        summary.bad_envelope += 1  # the bridge logged it, once, when its reason was new
     else:
         summary.duplicates += 1
     return True
 
 
-def _source_enabled(
-    settings: ServiceSettings, source: str, cache: dict[str, bool]
-) -> bool:
-    """Whether a source's held items may go out: its manifest is there, cleared for this
-    environment and no longer in shadow mode (the "sandbox test > shadow > enable" flow).
+def _source_enabled(settings: ServiceSettings, source: str) -> bool:
+    """Whether a source's open receipts may go out: its manifest is found (and is that source's:
+    a file whose ``id`` differs is not), cleared for this environment and out of shadow mode,
+    the "sandbox test > shadow > enable" flow a pull obeys. A manifest that cannot be read counts
+    as not enabled: its receipts wait, and the relay goes on with the other sources.
     """
-    if source not in cache:
-        try:
-            manifest = load_manifest(settings, source)
-        except NotFoundError:
-            cache[source] = False
-        else:
-            cache[source] = (
-                manifest.cleared_for(settings.environment) and not manifest.shadow
-            )
-    return cache[source]
+    try:
+        manifest = load_manifest(settings, source)
+    except NotFoundError:
+        return False
+    except ManifestError as exc:
+        # The source is a manifest id, and a ManifestError's message is content-free.
+        logger.warning("republish: %s: %s; its receipts wait", source, exc)
+        return False
+    except OSError as exc:
+        # The type only: the OS's text quotes the path.
+        logger.warning(
+            "republish: %s: the manifest could not be read (%s); its receipts wait",
+            source,
+            type(exc).__name__,
+        )
+        return False
+    return (
+        manifest.id == source
+        and manifest.cleared_for(settings.environment)
+        and not manifest.shadow
+    )
 
 
 def receipt_counts(

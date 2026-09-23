@@ -8,7 +8,7 @@ from .connector import (
     RunSummary,
     build_source,
 )
-from .manifest import MANIFEST_ID_PATTERN, DocumentManifest
+from .manifest import MANIFEST_ID_PATTERN, DocumentManifest, ManifestError
 
 __all__ = [
     "CONNECTOR",
@@ -16,6 +16,7 @@ __all__ = [
     "MANIFEST_ID_PATTERN",
     "DocumentConnector",
     "DocumentManifest",
+    "ManifestError",
     "RunSummary",
     "build_source",
 ]

@@ -6,7 +6,8 @@
     python -m src.cli schema envelope|manifest [--out FILE]           JSON Schema of a contract
 
 The same settings as the service (conf/application.conf and the environment). Exit codes: 0 done,
-1 the run had a problem (source unreachable, run aborted), 2 a setting is wrong.
+1 the run had a problem (source unreachable, run aborted), 2 a setting is wrong (a manifest that
+does not load included).
 """
 
 from __future__ import annotations
@@ -19,8 +20,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TextIO
 
-from src.config import Service, ServiceSettings, load_settings
-from src.connectors.documents import DocumentManifest
+from src.config import ServiceSettings, load_settings
+from src.connectors.documents import DocumentManifest, ManifestError
 from src.connectors.documents.sources import FetchError
 from src.error import UnavailableError
 from src.handler import documents
@@ -36,8 +37,22 @@ def _fail(message: str, code: int) -> int:
     return code
 
 
+def _os_problem(exc: OSError, verbose: bool) -> str:
+    """An OSError's type; its text, which quotes a path, only when the operator asks (-v)."""
+    return str(exc) if verbose else type(exc).__name__
+
+
 def _pull(args: argparse.Namespace, settings: ServiceSettings, out: TextIO) -> int:
-    manifest = DocumentManifest.load(args.manifest)
+    # A manifest that does not load is a wrong setting (exit 2), said content-free: never a
+    # traceback, which would quote the file through pydantic's message.
+    try:
+        manifest = DocumentManifest.load(args.manifest)
+    except ManifestError as exc:
+        return _fail(str(exc), 2)
+    except OSError as exc:
+        return _fail(
+            f"the manifest could not be read: {_os_problem(exc, args.verbose)}", 2
+        )
     try:
         # A command-line run has no job id, so it mints its trace id (printed with the summary).
         summary = documents.pull_documents(
@@ -45,8 +60,13 @@ def _pull(args: argparse.Namespace, settings: ServiceSettings, out: TextIO) -> i
         )
     except FetchError as exc:
         return _fail(str(exc), 1)
-    print("\n".join(summary.lines()), file=out)
-    return 1 if summary.aborted else 0
+    except OSError as exc:
+        # The File Store could not write, say: the OS's text quotes a path, so the type only,
+        # unless the operator asks for the detail (--verbose). No traceback either way.
+        return _fail(f"the pull stopped: {_os_problem(exc, args.verbose)}", 1)
+    # Paths only with --verbose: in a container, what a command prints is the log stream.
+    print("\n".join(summary.lines(verbose=args.verbose)), file=out)
+    return 1 if summary.error else 0
 
 
 def _republish(args: argparse.Namespace, settings: ServiceSettings, out: TextIO) -> int:
@@ -66,11 +86,12 @@ def _status(args: argparse.Namespace, settings: ServiceSettings, out: TextIO) ->
         file=out,
     )
     # The ingest id and the hash name the item; the message id (a path at the source, which can
-    # carry a patient's name) stays in the receipt.
+    # carry a patient's name) stays in the receipt. A pull's too_large marker has no hash: "-".
     for receipt in receipts:
+        sha = "-" if receipt.is_marker else receipt.payload_sha256[:12]
         print(
             f"  {receipt.received_at}  {receipt.status:<15} {receipt.source}  "
-            f"{receipt.ingest_id}  {receipt.payload_sha256[:12]}",
+            f"{receipt.ingest_id}  {sha}",
             file=out,
         )
     return 0
@@ -100,7 +121,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.cli", description="Nickel connection layer"
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="log every file")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="log every item (by ingest id) and print the paths of the files with problems",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     docs = commands.add_parser("documents", help="document sources (PDFs)")
@@ -124,7 +150,7 @@ def _parser() -> argparse.ArgumentParser:
         "--limit",
         type=_positive_int,
         default=None,
-        help="publish at most this many receipts",
+        help="take up at most this many receipts (published, set aside or not)",
     )
     status = doc_commands.add_parser("status", help="summarise the ingest receipts")
     status.add_argument("--source", default=None)
@@ -143,7 +169,8 @@ def _documents(
     args: argparse.Namespace, env: Mapping[str, str] | None, out: TextIO
 ) -> int:
     try:
-        settings = Service if env is None else load_settings(environ=env)
+        # Read for this run (the process environment, unless a test passes its own).
+        settings = load_settings(environ=env)
         documents.require_tenant(settings)
     except (ValueError, UnavailableError) as exc:
         return _fail(str(exc), 2)

@@ -3,6 +3,9 @@
 ``/health`` and ``/ready`` are ``async`` on purpose, although they await nothing yet: they then run on
 the event loop, so a probe still answers while blocking routes hold every worker thread, instead of
 queueing behind them until K3s restarts a healthy pod. SonarQube's S7503 is silenced for them.
+
+The probes are on ``health_router``, the only router without the service token (``src.services``);
+``/version`` names the build and the environment, so it is on ``version_router`` and takes the token.
 """
 
 from fastapi import APIRouter, Request
@@ -10,6 +13,7 @@ from fastapi import APIRouter, Request
 from src.models import HealthResponse, ReadyResponse, VersionResponse
 
 health_router = APIRouter(tags=["health"])
+version_router = APIRouter(tags=["health"])
 
 
 @health_router.get("/health")
@@ -24,7 +28,7 @@ async def ready() -> ReadyResponse:  # NOSONAR(S7503)
     return ReadyResponse(status="ready", checks={})
 
 
-@health_router.get("/version")
+@version_router.get("/version")
 def version(request: Request) -> VersionResponse:
     settings = request.app.state.settings  # the app's own (main.create_app)
     return VersionResponse(

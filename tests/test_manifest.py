@@ -1,8 +1,11 @@
+import logging
+import traceback
+
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from src.connectors.documents import DocumentManifest
+from src.connectors.documents import DocumentManifest, ManifestError
 from src.utility.keys import ObjectClass
 
 VALID = {
@@ -22,6 +25,15 @@ VALID = {
 }
 
 
+# A web-link source, which may run in any phase (the SDK sources are dev only).
+HTTP = {
+    **{k: v for k, v in VALID.items() if k != "huggingface"},
+    "fetch": "http",
+    "auth": {"type": "none", "vault_path": None},
+    "http": {"urls": ["https://lab.example/a.pdf"]},
+}
+
+
 def test_a_valid_manifest_loads_from_yaml(tmp_path):
     path = tmp_path / "hf-lab-reports.yaml"
     path.write_text(yaml.safe_dump(VALID), encoding="utf-8")
@@ -35,6 +47,9 @@ def test_a_valid_manifest_loads_from_yaml(tmp_path):
     assert manifest.huggingface.repo_type == "dataset"
     assert (manifest.auth.type, manifest.auth.vault_path) == ("hf_token", None)
     assert (manifest.contract.baa, manifest.contract.dpa) == (None, None)
+    assert (
+        manifest.schedule.frequency_class == "F4"
+    )  # on demand, unless it says otherwise
 
 
 @pytest.mark.parametrize(
@@ -201,7 +216,7 @@ def test_malformed_manifests_are_rejected(change):
     ],
 )
 def test_a_phase_clears_a_manifest_for_the_environments_up_to_it(phase, cleared):
-    manifest = DocumentManifest.model_validate({**VALID, "phase": phase})
+    manifest = DocumentManifest.model_validate({**HTTP, "phase": phase})
     for environment in ("development", "qa", "production"):
         assert manifest.cleared_for(environment) is (environment in cleared)
     assert not manifest.cleared_for("somewhere-else")
@@ -212,3 +227,182 @@ def test_include_and_exclude_globs_are_case_insensitive():
     assert manifest.wants("reports/2026/Report.PDF")
     assert not manifest.wants("notes.txt")
     assert not manifest.wants("drafts/a.pdf")
+
+
+# ── The review's manifest thread: schedule, tokens beyond dev, SDK sources ─────
+@pytest.mark.parametrize("frequency", ["F1", "F2", "F3", "F4", "F5"])
+def test_schedule_is_cn01s_shape_with_a_frequency_class(tmp_path, frequency):
+    path = tmp_path / "hf-lab-reports.yaml"
+    path.write_text(
+        yaml.safe_dump({**VALID, "schedule": {"class": frequency}}), encoding="utf-8"
+    )
+    assert DocumentManifest.load(path).schedule.frequency_class == frequency
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        "hourly",  # a string, as the manifests said before: on_demand alone still reads
+        {"class": "F6"},
+        {"class": "f4"},
+        {"class": "F4", "interval": "1h"},  # not here yet: comes with the scheduler
+        {"frequency_class": "F4"},  # the model's own name is not CN-01's key
+    ],
+)
+def test_a_schedule_outside_cn01s_shape_is_refused(schedule):
+    with pytest.raises(ValidationError, match="schedule"):
+        DocumentManifest.model_validate({**VALID, "schedule": schedule})
+
+
+@pytest.mark.parametrize("phase", ["qa", "prod"])
+@pytest.mark.parametrize(
+    "fetch, block, auth",
+    [
+        ("kaggle", {"kaggle": {"handle": "owner/dataset"}}, "kaggle_token"),
+        ("huggingface", {"huggingface": {"repo_id": "org/ds"}}, "hf_token"),
+    ],
+)
+def test_a_token_beyond_the_dev_phase_needs_a_vault_path(fetch, block, auth, phase):
+    """Environment tokens are for dev sources only: beyond dev, the manifest names where the
+    runner reads the credential. (The source is refused beyond dev anyway, below; this is the
+    first thing it is told.)"""
+    base = {k: v for k, v in VALID.items() if k != "huggingface"}
+    data = {**base, "fetch": fetch, **block, "phase": phase}
+    with pytest.raises(ValidationError, match="needs auth.vault_path"):
+        DocumentManifest.model_validate(
+            {**data, "auth": {"type": auth, "vault_path": None}}
+        )
+    dev = {**data, "phase": "dev", "auth": {"type": auth, "vault_path": None}}
+    assert DocumentManifest.model_validate(dev).auth.vault_path is None
+
+
+@pytest.mark.parametrize("phase", ["qa", "prod"])
+@pytest.mark.parametrize(
+    "fetch, block, auth",
+    [
+        ("kaggle", {"kaggle": {"handle": "owner/dataset"}}, "kaggle_token"),
+        ("huggingface", {"huggingface": {"repo_id": "org/ds"}}, "hf_token"),
+        ("huggingface", {"huggingface": {"repo_id": "org/ds"}}, "none"),
+    ],
+)
+def test_an_sdk_source_is_refused_beyond_the_dev_phase(fetch, block, auth, phase):
+    """The Kaggle and Hugging Face SDKs download on their own, outside the egress rule: a
+    manifest that clears one for qa or production is refused, even with its token in Vault.
+    """
+    base = {k: v for k, v in VALID.items() if k != "huggingface"}
+    data = {
+        **base,
+        "fetch": fetch,
+        **block,
+        "phase": phase,
+        "auth": {"type": auth, "vault_path": "secret/nickel/sources/token"},
+    }
+    with pytest.raises(ValidationError, match="dev phase only"):
+        DocumentManifest.model_validate(data)
+
+
+def test_the_old_schedule_string_on_demand_still_reads_as_f4_for_one_release(
+    tmp_path, records
+):
+    """The re-review's probe: the dev deployment's manifests on disk still say
+    ``schedule: on_demand``, the string before CN-01's shape, and every pull of one failed with a
+    bare ValidationError. It reads as {class: F4} for this release, with a warning at each load.
+    """
+    path = tmp_path / "hf-lab-reports.yaml"
+    path.write_text(
+        yaml.safe_dump({**VALID, "schedule": "on_demand"}), encoding="utf-8"
+    )
+    assert DocumentManifest.load(path).schedule.frequency_class == "F4"
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "manifest hf-lab-reports: schedule: on_demand is deprecated and read as "
+        "{class: F4} for this release only; write schedule: {class: F4}"
+    ]
+
+
+_SCHEDULE_IS_A_MAPPING = (
+    "schedule value_error (schedule is a mapping, {class: F1..F5}; of the old strings only "
+    "on_demand is still read, as {class: F4})"
+)
+_NO_CREDENTIAL = (
+    "http value_error (https://lab.example: http.urls must carry no user or password (a "
+    "credential belongs in Vault: auth.vault_path))"
+)
+
+
+@pytest.mark.parametrize(
+    "content, problem",
+    [
+        ({**VALID, "schedule": "Jane_Doe_weekly"}, _SCHEDULE_IS_A_MAPPING),
+        ({**VALID, "license": ""}, "license string_too_short"),
+        ({**VALID, "id": "Jane Doe"}, "id string_pattern_mismatch"),
+        (
+            {**HTTP, "http": {"urls": ["ftp://user:secret@lab.example/Jane_Doe.pdf"]}},
+            "http url_scheme",
+        ),
+        (
+            {
+                **HTTP,
+                "http": {"urls": ["https://user:secret@lab.example/Jane_Doe.pdf"]},
+            },
+            _NO_CREDENTIAL,
+        ),
+        (
+            {**VALID, "phi": True},
+            "value_error (a PHI source needs a business associate agreement: set "
+            "contract.baa)",
+        ),
+        # A key the model does not know is the file's own text: its error type alone.
+        ({**VALID, "Jane_Doe_MRN12345.pdf": "x"}, "extra_forbidden"),
+        ({**VALID, "schedule": {"Jane_Doe": 1}}, "schedule extra_forbidden"),
+        (["Jane_Doe"], "model_type"),
+        (
+            {"id": "Jane Doe"},
+            "auth missing, contract missing, description missing, fetch missing, "
+            "id string_pattern_mismatch and 7 more",
+        ),
+    ],
+)
+def test_a_manifest_that_does_not_validate_says_where_and_why_without_quoting_it(
+    tmp_path, content, problem
+):
+    """The re-review: a manifest that did not validate failed a job with a bare
+    "ValidationError", and the command line printed pydantic's message, which quotes the file (a
+    folder's path, a link with its credential). The error names the field and pydantic's error
+    type now, and this module's own message, which names fields and hosts only; a traceback of it
+    carries nothing more."""
+    path = tmp_path / "m.yaml"
+    path.write_text(yaml.safe_dump(content), encoding="utf-8")
+    with pytest.raises(ManifestError) as caught:
+        DocumentManifest.load(path)
+    assert str(caught.value) == f"manifest does not validate: {problem}"
+    shown = "".join(traceback.format_exception(caught.value))
+    assert "Jane" not in shown
+    assert "secret" not in shown
+
+
+@pytest.mark.parametrize(
+    "content, problem",
+    [
+        (b"id: [Jane_Doe\n", "ParserError at line 2, column 1"),
+        (b"id: Jane_Doe \xff\n", "ReaderError"),  # not UTF-8
+    ],
+)
+def test_a_manifest_that_is_not_yaml_says_where_without_quoting_it(
+    tmp_path, content, problem
+):
+    """The YAML parser's message quotes the line it stopped at: the error is its type, and the
+    line and column when the parser knows them."""
+    path = tmp_path / "m.yaml"
+    path.write_bytes(content)
+    with pytest.raises(ManifestError) as caught:
+        DocumentManifest.load(path)
+    assert str(caught.value) == f"manifest is not YAML: {problem}"
+    assert "Jane" not in "".join(traceback.format_exception(caught.value))
+
+
+def test_a_manifest_that_cannot_be_read_is_an_os_error_for_the_caller(tmp_path):
+    """Not a ManifestError: the caller has the path, and says what it can (the command line
+    exits 2, the relay logs the error's type)."""
+    with pytest.raises(FileNotFoundError):
+        DocumentManifest.load(tmp_path / "gone.yaml")

@@ -10,7 +10,8 @@ fetch: kaggle
 auth:
   type: kaggle_token
   vault_path: null  # development: the Kaggle token comes from the environment (docs/docker.md)
-schedule: on_demand
+schedule:
+  class: F4  # on demand (CN-01 frequency class): the scheduler or an operator starts a pull
 formats: [pdf]
 phi: false
 owner: divij

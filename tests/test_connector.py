@@ -1,15 +1,14 @@
-import dataclasses
 import re
 
 import pytest
 
+from src.config import DEFAULT_MAX_FILE_BYTES
 from src.connectors.documents import (
     DocumentConnector,
     DocumentManifest,
     RunSummary,
     build_source,
 )
-from src.connectors.documents import connector as connector_module
 from src.connectors.documents.sources import (
     FetchError,
     HttpSource,
@@ -26,6 +25,15 @@ from src.handler.ingest import IngestBridge
 
 TENANT = "0192a3b4-0000-7000-8000-000000000001"
 AUTH_TYPES = {"kaggle": "kaggle_token", "huggingface": "hf_token"}
+
+
+# The settings the handler passes (ServiceSettings.environment and .max_file_bytes): a development
+# deployment with the default cap, unless a test says otherwise.
+DEPLOYMENT = {"environment": "development", "max_file_bytes": DEFAULT_MAX_FILE_BYTES}
+
+
+def _connector(manifest, bridge, source=None, **kw):
+    return DocumentConnector(manifest, bridge, source, **{**DEPLOYMENT, **kw})
 
 
 def _manifest(fetch="local", **over):
@@ -45,7 +53,8 @@ def _manifest(fetch="local", **over):
         "auth": {"type": AUTH_TYPES.get(fetch, "none"), "vault_path": None},
         "phi": False,
         "owner": "divij",
-        "phase": "prod",  # a clinic's own source; the phase tests set theirs
+        # A clinic's own source; the phase tests set theirs. The SDK sources are dev only.
+        "phase": "dev" if fetch in ("kaggle", "huggingface") else "prod",
         "shadow": False,
         "contract": {"baa": None, "dpa": None},
         "license": "test only",
@@ -83,12 +92,12 @@ def test_end_to_end_from_a_local_folder(tmp_path, bridge, pdf_bytes):
     (folder / "fake.pdf").write_bytes(b"<html>a login page</html>")
     manifest = _manifest(local={"path": str(folder)})
 
-    summary = DocumentConnector(manifest, bridge).run()
+    summary = _connector(manifest, bridge).run()
     assert (summary.listed, summary.matched) == (5, 4)
     # three published, but the copy shares a's stored object
     assert (summary.published, summary.new_objects, summary.rejected) == (3, 2, 1)
     assert summary.problems == [
-        "fake.pdf: content does not match the declared formats ['pdf']"
+        ("fake.pdf", "content does not match the declared formats ['pdf']")
     ]
     messages = bridge.publisher.read("raw_data")
     assert {m["value"]["message_id"] for m in messages} == {
@@ -97,7 +106,7 @@ def test_end_to_end_from_a_local_folder(tmp_path, bridge, pdf_bytes):
         "local:src/copy-of-a.pdf",
     }
 
-    again = DocumentConnector(manifest, bridge).run()
+    again = _connector(manifest, bridge).run()
     assert (again.published, again.duplicates, again.rejected) == (0, 3, 1)
     assert any(line.startswith("duplicates      3") for line in again.lines())
 
@@ -117,16 +126,13 @@ def test_a_file_name_the_file_system_could_not_decode_does_not_stop_the_run(
     except OSError as exc:  # a file system that refuses the name cannot meet the bug
         pytest.skip(f"the file system refuses such a name: {exc}")
     (folder / "z.pdf").write_bytes(pdf_bytes + b"% after it in the listing\n")
-    summary = DocumentConnector(_manifest(local={"path": str(folder)}), bridge).run()
+    summary = _connector(_manifest(local={"path": str(folder)}), bridge).run()
     assert (summary.published, summary.rejected, summary.skipped) == (2, 0, 0)
     ids = sorted(m["value"]["message_id"] for m in bridge.publisher.read("raw_data"))
     assert ids == ["local:src/report\\udcff.pdf", "local:src/z.pdf"]
     # Stable: the same name spells the same id on the next pull.
     assert (
-        DocumentConnector(_manifest(local={"path": str(folder)}), bridge)
-        .run()
-        .duplicates
-        == 2
+        _connector(_manifest(local={"path": str(folder)}), bridge).run().duplicates == 2
     )
 
 
@@ -135,7 +141,7 @@ def test_the_counts_are_the_numbers_only(tmp_path, bridge, pdf_bytes):
     folder.mkdir()
     (folder / "a.pdf").write_bytes(pdf_bytes)
     (folder / "fake.pdf").write_bytes(b"not a pdf")
-    summary = DocumentConnector(_manifest(local={"path": str(folder)}), bridge).run()
+    summary = _connector(_manifest(local={"path": str(folder)}), bridge).run()
     assert summary.counts() == {
         "listed": 2,
         "matched": 2,
@@ -143,6 +149,7 @@ def test_the_counts_are_the_numbers_only(tmp_path, bridge, pdf_bytes):
         "held": 0,
         "duplicates": 0,
         "rejected": 1,
+        "too_large": 0,
         "skipped": 0,
         "refused": 0,
         "new_objects": 1,
@@ -153,31 +160,32 @@ def test_the_counts_are_the_numbers_only(tmp_path, bridge, pdf_bytes):
 
 def test_limit_and_max_files_cap_the_run(bridge, pdf_bytes):
     items = [_file(f"{n}.pdf", pdf_bytes + bytes([n])) for n in range(5)]
-    assert (
-        DocumentConnector(_manifest(), bridge, FakeSource(items)).run(limit=2).matched
-        == 2
-    )
+    assert _connector(_manifest(), bridge, FakeSource(items)).run(limit=2).matched == 2
     capped = _manifest(max_files=1)
-    assert (
-        DocumentConnector(capped, bridge, FakeSource(items)).run(limit=3).matched == 1
-    )
+    assert _connector(capped, bridge, FakeSource(items)).run(limit=3).matched == 1
 
 
-def test_files_over_the_size_cap_are_skipped_before_download(bridge):
+def test_a_file_listed_over_the_cap_is_not_downloaded_and_leaves_a_receipt(bridge):
     items = [_file("big.pdf", size=10, error=AssertionError("must not fetch"))]
-    summary = DocumentConnector(
-        _manifest(max_file_bytes=5), bridge, FakeSource(items)
-    ).run()
-    assert (summary.skipped, summary.published) == (1, 0)
-    assert "over the 5 cap" in summary.problems[0]
+    summary = _connector(_manifest(max_file_bytes=5), bridge, FakeSource(items)).run()
+    assert (summary.too_large, summary.skipped, summary.published) == (1, 0, 0)
+    assert summary.problems == [("big.pdf", "10 bytes; the cap is 5")]
+    [receipt] = bridge.receipts.recent(tenant_id=TENANT)
+    assert (receipt.status, receipt.payload_ref, receipt.envelope) == (
+        ReceiptStatus.TOO_LARGE,
+        None,
+        None,
+    )
+    assert bridge.publisher.read("raw_data") == []
 
 
-def test_a_file_over_the_service_cap_is_skipped_not_rejected(
+def test_a_file_over_the_bridges_cap_is_too_large_not_rejected(
     tmp_path, receipts, pdf_bytes
 ):
     """NICKEL_MAX_FILE_BYTES holds it back for now: the receipt says too_large and the file goes
-    through once the cap is raised. The counts say skipped, as for the manifest's own size cap, not
-    rejected, which is final (empty, or not the declared format)."""
+    through once the cap is raised. The counts say too_large, as for a file over the cap at the
+    source, not rejected, which is final (empty, or not the declared format), nor skipped.
+    """
     bridge = IngestBridge(
         tenant_id=TENANT,
         store=LocalFileStore(tmp_path / "fs"),
@@ -186,10 +194,10 @@ def test_a_file_over_the_service_cap_is_skipped_not_rejected(
         max_bytes=10,
     )
     items = [_file("big.pdf", pdf_bytes)]  # no size known up front: the bridge decides
-    summary = DocumentConnector(_manifest(), bridge, FakeSource(items)).run()
-    assert (summary.skipped, summary.rejected, summary.published) == (1, 0, 0)
+    summary = _connector(_manifest(), bridge, FakeSource(items)).run()
+    assert (summary.too_large, summary.skipped, summary.rejected) == (1, 0, 0)
     assert summary.problems == [
-        f"big.pdf: payload is {len(pdf_bytes)} bytes; the cap is 10"
+        ("big.pdf", f"payload is {len(pdf_bytes)} bytes; the cap is 10")
     ]
     [receipt] = receipts.recent(tenant_id=TENANT)
     assert receipt.status is ReceiptStatus.TOO_LARGE
@@ -200,9 +208,9 @@ def test_one_failed_download_does_not_stop_the_run(bridge, pdf_bytes):
         _file("broken.pdf", error=FetchError("timeout")),
         _file("ok.pdf", pdf_bytes),
     ]
-    summary = DocumentConnector(_manifest(), bridge, FakeSource(items)).run()
+    summary = _connector(_manifest(), bridge, FakeSource(items)).run()
     assert (summary.skipped, summary.published) == (1, 1)
-    assert summary.problems == ["broken.pdf: fetch failed: timeout"]
+    assert summary.problems == [("broken.pdf", "fetch failed: timeout")]
 
 
 def test_a_publish_failure_aborts_the_run(tmp_path, receipts, pdf_bytes):
@@ -217,7 +225,7 @@ def test_a_publish_failure_aborts_the_run(tmp_path, receipts, pdf_bytes):
         receipts=receipts,
     )
     items = [_file("a.pdf", pdf_bytes), _file("b.pdf", pdf_bytes + b"x")]
-    summary = DocumentConnector(_manifest(), bridge, FakeSource(items)).run()
+    summary = _connector(_manifest(), bridge, FakeSource(items)).run()
     assert summary.aborted.startswith("publish failed at a.pdf")
     assert summary.error == "publish failed; the pull stopped"  # no file name
     assert summary.matched == 1
@@ -227,7 +235,7 @@ def test_a_publish_failure_aborts_the_run(tmp_path, receipts, pdf_bytes):
 def test_http_items_are_identified_by_their_url(bridge, pdf_bytes):
     url = "https://lab.example/reports/cbc.pdf"
     items = [_file("cbc.pdf", pdf_bytes, url=url)]
-    DocumentConnector(_manifest("http"), bridge, FakeSource(items, "http")).run()
+    _connector(_manifest("http"), bridge, FakeSource(items, "http")).run()
     [message] = bridge.publisher.read("raw_data")
     assert message["value"]["message_id"] == url
     assert message["value"]["source_meta"]["url"] == url
@@ -239,7 +247,7 @@ def test_the_envelope_carries_the_manifest_fetch_route_and_mode_and_the_run_id(
     manifest = _manifest("http", route="L3")
     items = [_file("cbc.pdf", pdf_bytes, url="https://lab.example/a.pdf")]
     trace = "0192a3b40000700080000000000000ef"
-    summary = DocumentConnector(
+    summary = _connector(
         manifest, bridge, FakeSource(items, "http"), trace_id=trace
     ).run()
     [message] = bridge.publisher.read("raw_data")
@@ -253,7 +261,7 @@ def test_the_envelope_carries_the_manifest_fetch_route_and_mode_and_the_run_id(
     assert envelope["trace_id"] == trace == summary.trace_id
     assert f"trace_id        {trace}" in summary.lines()
     # A run with no job to name it mints its own id.
-    fresh = DocumentConnector(manifest, bridge, FakeSource(items, "http"))
+    fresh = _connector(manifest, bridge, FakeSource(items, "http"))
     assert re.fullmatch(r"[0-9a-f]{32}", fresh.trace_id)
     assert fresh.trace_id != trace
 
@@ -285,20 +293,28 @@ def test_the_cap_in_force_is_the_smaller_of_the_manifest_and_the_service(bridge)
     download (a listed size) and at the source."""
     items = [_file("big.pdf", size=20, error=AssertionError("must not fetch"))]
     manifest = _manifest("http", max_file_bytes=50)
-    tighter = DocumentConnector(manifest, bridge, FakeSource(items), max_file_bytes=10)
+    tighter = _connector(manifest, bridge, FakeSource(items), max_file_bytes=10)
     assert tighter.max_file_bytes == 10
     summary = tighter.run()
-    assert (summary.skipped, summary.published) == (1, 0)
-    assert "over the 10 cap" in summary.problems[0]
-    assert DocumentConnector(manifest, bridge, max_file_bytes=10).source.max_bytes == 10
-    looser = DocumentConnector(manifest, bridge, max_file_bytes=1000)
+    assert (summary.too_large, summary.published) == (1, 0)
+    assert summary.problems == [("big.pdf", "20 bytes; the cap is 10")]
+    assert _connector(manifest, bridge, max_file_bytes=10).source.max_bytes == 10
+    looser = _connector(manifest, bridge, max_file_bytes=1000)
     assert looser.max_file_bytes == looser.source.max_bytes == 50
 
 
-def test_the_service_cap_comes_from_the_settings_by_default(monkeypatch, bridge):
-    capped = dataclasses.replace(connector_module.Service, max_file_bytes=7)
-    monkeypatch.setattr(connector_module, "Service", capped)
-    assert DocumentConnector(_manifest(), bridge, FakeSource([])).max_file_bytes == 7
+def test_the_environment_and_the_cap_are_required_arguments(bridge):
+    """The environment a manifest's phase must clear and the service's size cap come from the
+    caller (the handler passes the service's settings): there is no settings global to fall back
+    on (tests/test_config_and_logging.py), so a caller that forgets one fails at once instead of
+    running on import-time values.
+    """
+    with pytest.raises(TypeError, match="environment"):
+        DocumentConnector(_manifest(), bridge, FakeSource([]), max_file_bytes=7)
+    with pytest.raises(TypeError, match="max_file_bytes"):
+        DocumentConnector(
+            _manifest(), bridge, FakeSource([]), environment="development"
+        )
 
 
 def test_problem_notes_are_capped():
@@ -329,7 +345,7 @@ def test_a_pull_racing_another_pull_of_the_same_source_goes_on(
     items = [_file("a.pdf", pdf_bytes), _file("b.pdf", pdf_bytes + b"x")]
     store = LocalFileStore(tmp_path / "fs")
     outbox = JsonlOutbox(tmp_path / "out")
-    rival = DocumentConnector(
+    rival = _connector(
         _manifest(),
         IngestBridge(
             tenant_id=TENANT, store=store, publisher=outbox, receipts=receipts
@@ -342,7 +358,7 @@ def test_a_pull_racing_another_pull_of_the_same_source_goes_on(
         publisher=outbox,
         receipts=Interleaving(receipts, lambda: rival.run(limit=1)),
     )
-    summary = DocumentConnector(_manifest(), racing, FakeSource(items)).run()
+    summary = _connector(_manifest(), racing, FakeSource(items)).run()
     assert summary.aborted is None
     assert (summary.published, summary.duplicates) == (1, 1)
     assert len(outbox.read("raw_data")) == 2
@@ -354,30 +370,33 @@ def test_a_refused_download_is_counted_apart_from_a_failed_one(bridge, pdf_bytes
         _file("broken.pdf", error=FetchError("timeout")),
         _file("ok.pdf", pdf_bytes),
     ]
-    summary = DocumentConnector(_manifest(), bridge, FakeSource(items)).run()
+    summary = _connector(_manifest(), bridge, FakeSource(items)).run()
     assert (summary.refused, summary.skipped, summary.published) == (1, 1, 1)
     assert summary.counts()["refused"] == 1
-    assert summary.problems[0] == "evil.pdf: refused https://cdn.other: not a host"
+    assert summary.problems[0] == (
+        "evil.pdf",
+        "refused https://cdn.other: not a host",
+    )
     assert any(line.startswith("refused         1") for line in summary.lines())
 
 
 def test_shadow_mode_stores_and_receipts_but_publishes_nothing(bridge, pdf_bytes):
     items = [_file("a.pdf", pdf_bytes), _file("b.pdf", pdf_bytes + b"x")]
-    shadow = DocumentConnector(_manifest(shadow=True), bridge, FakeSource(items)).run()
+    shadow = _connector(_manifest(shadow=True), bridge, FakeSource(items)).run()
     assert (shadow.held, shadow.published, shadow.new_objects) == (2, 0, 2)
     assert shadow.counts()["held"] == 2
     assert bridge.publisher.read("raw_data") == []
-    held = bridge.receipts.with_status(ReceiptStatus.HELD, tenant_id=TENANT)
+    held = list(
+        bridge.receipts.in_status(ReceiptStatus.HELD, {"test-docs"}, tenant_id=TENANT)
+    )
     assert [r.detail for r in held] == ["held for shadow mode"] * 2
     assert all(bridge.store.get(r.payload_ref).startswith(b"%PDF-") for r in held)
     assert any(line.startswith("held            2") for line in shadow.lines())
     # Still in shadow: the same items are held again, nothing is stored or published.
-    again = DocumentConnector(_manifest(shadow=True), bridge, FakeSource(items)).run()
+    again = _connector(_manifest(shadow=True), bridge, FakeSource(items)).run()
     assert (again.held, again.new_objects) == (2, 0)
     # Enabled: the held items go out under the ingest ids they were held under.
-    enabled = DocumentConnector(
-        _manifest(shadow=False), bridge, FakeSource(items)
-    ).run()
+    enabled = _connector(_manifest(shadow=False), bridge, FakeSource(items)).run()
     assert (enabled.published, enabled.held, enabled.new_objects) == (2, 0, 0)
     published = {m["value"]["ingest_id"] for m in bridge.publisher.read("raw_data")}
     assert published == {r.ingest_id for r in held}
@@ -386,7 +405,7 @@ def test_shadow_mode_stores_and_receipts_but_publishes_nothing(bridge, pdf_bytes
 
 def test_a_dev_manifest_is_refused_in_production(bridge, pdf_bytes):
     items = [_file("a.pdf", pdf_bytes)]
-    refused = DocumentConnector(
+    refused = _connector(
         _manifest(phase="dev"), bridge, FakeSource(items), environment="production"
     ).run()
     assert refused.aborted == (
@@ -395,30 +414,10 @@ def test_a_dev_manifest_is_refused_in_production(bridge, pdf_bytes):
     assert refused.error == refused.aborted  # content-free: a job record keeps it
     assert (refused.listed, refused.published) == (0, 0)
     assert bridge.publisher.read("raw_data") == []
-    cleared = DocumentConnector(
+    cleared = _connector(
         _manifest(phase="prod"), bridge, FakeSource(items), environment="production"
     ).run()
     assert cleared.published == 1
-
-
-def test_the_environment_comes_from_the_service_settings(
-    monkeypatch, bridge, pdf_bytes
-):
-    items = [_file("a.pdf", pdf_bytes)]
-    in_production = dataclasses.replace(
-        connector_module.Service, environment="production"
-    )
-    monkeypatch.setattr(connector_module, "Service", in_production)
-    summary = DocumentConnector(_manifest(phase="dev"), bridge, FakeSource(items)).run()
-    assert "production" in summary.aborted
-    in_development = dataclasses.replace(in_production, environment="development")
-    monkeypatch.setattr(connector_module, "Service", in_development)
-    assert (
-        DocumentConnector(_manifest(phase="dev"), bridge, FakeSource(items))
-        .run()
-        .published
-        == 1
-    )
 
 
 @pytest.mark.parametrize("retention", ["forever", "90d"])
@@ -426,9 +425,7 @@ def test_retention_comes_from_the_manifest(bridge, pdf_bytes, retention):
     """The object class stays documents whatever the retention; the value itself is recorded on
     the stored object's sidecar, where the File Store lifecycle rule reads it."""
     manifest = _manifest(raw_retention=retention)
-    connector = DocumentConnector(
-        manifest, bridge, FakeSource([_file("a.pdf", pdf_bytes)])
-    )
+    connector = _connector(manifest, bridge, FakeSource([_file("a.pdf", pdf_bytes)]))
     assert connector.context.retention_class is manifest.retention_class
     assert connector.context.raw_retention == manifest.raw_retention == retention
     connector.run()

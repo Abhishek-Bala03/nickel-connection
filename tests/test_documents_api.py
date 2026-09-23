@@ -116,12 +116,13 @@ def test_a_pull_applies_the_deployments_size_cap_at_the_source(
     settings, pdf_folder, manifest_writer
 ):
     """The cap in force is the smaller of the manifest's and this deployment's
-    (NICKEL_MAX_FILE_BYTES): a file over the deployment's cap is skipped at the source, before
-    it is read, so it never reaches the bridge and gets no receipt."""
+    (NICKEL_MAX_FILE_BYTES): a file over the deployment's cap is stopped at the source, before it
+    is read, and leaves a too_large receipt (before, it left none, and never showed up).
+    """
     small = dataclasses.replace(settings, max_file_bytes=16)
     manifest_writer(pdf_folder, small.manifest_dir)
     summary = documents.pull_documents(
         small, documents.load_manifest(small, "local-docs")
     )
-    assert (summary.matched, summary.skipped, summary.published) == (1, 1, 0)
-    assert documents.receipt_counts(small) == {}
+    assert (summary.matched, summary.too_large, summary.published) == (1, 1, 0)
+    assert documents.receipt_counts(small) == {"too_large": 1}

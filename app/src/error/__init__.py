@@ -1,10 +1,11 @@
 """Errors the service raises on purpose, and the handlers that turn every error into the same JSON shape.
 
 Raise one of these from a handler; the client gets ``{"error": {"code", "message"}, "request_id"}``
-with the matching status. Framework errors (unknown route, wrong method, invalid request) use the same
-shape and keep their headers (``Allow``, ``WWW-Authenticate``, ``Retry-After``). Anything unexpected,
-and any 5xx detail, becomes a generic message: stack traces and internals never reach the client, they
-go to the log with the request id.
+with the matching status, and the headers the status calls for (``WWW-Authenticate`` on a 401).
+Framework errors (unknown route, wrong method, invalid request) use the same shape and keep their
+headers (``Allow``, ``WWW-Authenticate``, ``Retry-After``). Anything unexpected, and any 5xx detail,
+becomes a generic message: stack traces and internals never reach the client, they go to the log with
+the request id.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ _NO_BODY = (204, 304)
 class NickelConnectionError(Exception):
     status_code = 500
     code = "internal_error"
-    # Sent with the response: Retry-After on a 429.
+    # Sent with the response: WWW-Authenticate on a 401, Retry-After on a 429.
     headers: Mapping[str, str] | None = None
 
     def __init__(self, message: str = "Something went wrong") -> None:
@@ -51,6 +52,19 @@ class NickelConnectionError(Exception):
 class BadRequestError(NickelConnectionError):
     status_code = 400
     code = "bad_request"
+
+
+class UnauthorizedError(NickelConnectionError):
+    """The request carries no valid service token (``src.services.auth``). One message for a missing
+    and for a wrong token: the response says nothing about which, or about the token itself.
+    """
+
+    status_code = 401
+    code = "unauthorized"
+    headers = {"WWW-Authenticate": "Bearer"}
+
+    def __init__(self, message: str = "A valid service token is required") -> None:
+        super().__init__(message)
 
 
 class NotFoundError(NickelConnectionError):

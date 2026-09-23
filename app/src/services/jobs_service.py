@@ -71,9 +71,9 @@ def queue_republish(
     response: Response,
     idempotency_key: IdempotencyKey = None,
 ) -> JobAccepted:
-    """Queue a republish of the open receipts from the envelopes they store: received and
-    publish_failed ones, and held ones once their source is enabled (503 without a tenant, 429
-    when the queue is full)."""
+    """Queue a republish of the open receipts from the envelopes they store: received,
+    publish_failed and held ones, each only while its source is enabled (503 without a tenant,
+    429 when the queue is full)."""
     documents.require_tenant(jobs.settings)
     job, created = jobs.submit(
         REPUBLISH_KIND,

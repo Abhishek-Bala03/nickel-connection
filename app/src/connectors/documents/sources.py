@@ -5,13 +5,15 @@ of 20 files downloads 20 files. Any failure to fetch one file is a ``FetchError`
 a download the egress rule stops before it starts is a ``RefusedError`` (a ``FetchError`` too).
 Every source takes the size cap in force (``DocumentConnector``: the smaller of the manifest's and
 the service's) and hands back no file over it: a web download stops at the cap, and a file an SDK
-put on disk is measured before it is read into memory.
+put on disk is measured before it is read into memory. Either way it raises ``TooLargeError`` (a
+``FetchError``) with the size seen, if any, and the connector leaves a too_large receipt.
 
 The text of a ``FetchError`` is content-free by contract: a job record keeps it and ``GET /jobs``
 returns it. It names the source's locator (the manifest's handle, repo or host) and the failure's
 type or HTTP status, never a file's path, a redirect's query string or a library's own message: a
-clinic's file names can carry patient names, and a signed URL carries its token. The SDK sources
-log the library's message (a path is a debugging detail, not a secret); httpx's is dropped.
+clinic's file names can carry patient names, and a signed URL carries its token. The log follows the
+same rule: a failure is logged as the locator and the error's type, never the library's message
+(the SDKs' messages quote the resolve URL, and so the file's path) and never a folder's path.
 
 Credentials never come through here: kagglehub reads ``KAGGLE_API_TOKEN`` (or ``~/.kaggle``) and
 huggingface_hub reads ``HF_TOKEN`` from the environment themselves.
@@ -50,6 +52,16 @@ class RefusedError(FetchError):
     host the manifest does not name, or a private or local address."""
 
 
+class TooLargeError(FetchError):
+    """The file is over the size cap in force, so nothing of it is kept or read into memory.
+    ``size`` is the size seen (the file an SDK put on disk), or None when a download stopped at the
+    cap without one. The connector leaves a too_large receipt for it (metadata only)."""
+
+    def __init__(self, message: str, *, size: int | None) -> None:
+        super().__init__(message)
+        self.size = size
+
+
 @dataclass(frozen=True)
 class SourceFile:
     rel_path: str  # POSIX path inside the source
@@ -68,8 +80,9 @@ def _read_capped(path: Path, max_bytes: int, where: str) -> bytes:
     """The file's bytes, once its size on disk is known to be within the cap: nothing over the cap
     is read into memory, whatever the source listed for it, or did not (Kaggle lists no sizes).
     """
-    if path.stat().st_size > max_bytes:
-        raise FetchError(f"{where}: larger than the {max_bytes}-byte cap")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise TooLargeError(f"{where}: larger than the {max_bytes}-byte cap", size=size)
     return path.read_bytes()
 
 
@@ -85,11 +98,19 @@ def _posix_path(path: Path, root: Path) -> str:
 
 
 def _folder_files(root: Path, max_bytes: int, where: str) -> Iterator[SourceFile]:
+    """The files the walk found, each one's size read when it comes up. A file that vanished, or
+    became unreadable, since the walk is listed without a size: its fetch then fails for that file
+    alone (an OSError the connector counts as one skip), instead of the error escaping the listing
+    and ending the run, with the rest of the folder never pulled."""
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        try:
+            size: int | None = path.stat().st_size
+        except OSError:
+            size = None
         yield SourceFile(
             rel_path=_posix_path(path, root),
             fetch=partial(_read_capped, path, max_bytes, where),
-            size=path.stat().st_size,
+            size=size,
         )
 
 
@@ -103,9 +124,8 @@ class LocalDirSource(Source):
 
     def files(self) -> Iterator[SourceFile]:
         if not self.root.is_dir():
-            logger.warning(
-                "local source %s: %s is not a folder", self.locator, self.root
-            )
+            # The locator only: the folder's path can carry a clinic's or a patient's name.
+            logger.warning("local source %s: not a folder", self.locator)
             raise FetchError(f"local {self.locator}: not a folder")
         yield from _folder_files(self.root, self.max_bytes, f"local {self.locator}")
 
@@ -138,8 +158,9 @@ class KaggleSource(Source):
         return f"https://www.kaggle.com/datasets/{self.handle.split('/versions/')[0]}"
 
     def _failure(self, exc: Exception) -> FetchError:
-        """Content-free (module docstring): kagglehub's message can name the file it choked on."""
-        logger.warning("kaggle %s: %s: %s", self.handle, type(exc).__name__, exc)
+        """Content-free, in the error and in the log (module docstring): kagglehub's message can
+        name the file it choked on."""
+        logger.warning("kaggle %s: %s", self.handle, type(exc).__name__)
         return FetchError(f"kaggle {self.handle}: {type(exc).__name__}")
 
     def _fetch_one(self, rel_path: str) -> bytes:
@@ -202,8 +223,9 @@ class HuggingFaceSource(Source):
         return f"https://huggingface.co/{prefix}{self.repo_id}/resolve/{self.revision or 'main'}/{path}"
 
     def _failure(self, exc: Exception) -> FetchError:
-        """Content-free (module docstring): the hub's message can name the file it choked on."""
-        logger.warning("huggingface %s: %s: %s", self.locator, type(exc).__name__, exc)
+        """Content-free, in the error and in the log (module docstring): the hub's message quotes
+        the resolve URL, with the file's path in it."""
+        logger.warning("huggingface %s: %s", self.locator, type(exc).__name__)
         return FetchError(f"huggingface {self.repo_id}: {type(exc).__name__}")
 
     def _fetch_one(self, path: str) -> bytes:
@@ -348,12 +370,19 @@ class PinnedBackend(httpcore.NetworkBackend):
 
 
 class _PinnedTransport(httpx.HTTPTransport):
-    """httpx's own transport, over a connection pool that dials through a PinnedBackend."""
+    """httpx's own transport, over a connection pool that dials through a PinnedBackend.
+
+    The pool's TLS context trusts the CA bundle httpx ships (certifi) and nothing the environment
+    says: ``trust_env=False``, so ``SSL_CERT_FILE`` or ``SSL_CERT_DIR`` cannot change whom the pinned
+    connection trusts. ``super().__init__()`` is not called on purpose: it would build a pool of its
+    own, with a context read from the environment, only for this one to replace it; the transport's
+    methods (``handle_request``, ``close``, the context manager) use ``_pool`` and nothing else.
+    """
 
     def __init__(self, backend: httpcore.NetworkBackend) -> None:
-        super().__init__()
         self._pool = httpcore.ConnectionPool(
-            ssl_context=httpx.create_ssl_context(), network_backend=backend
+            ssl_context=httpx.create_ssl_context(trust_env=False),
+            network_backend=backend,
         )
 
 
@@ -406,10 +435,13 @@ class HttpSource(Source):
     def _get(self, url: str) -> bytes:
         if self._client is not None:
             return self._download(self._client, url)
+        # trust_env=False as well: the custom transport already ignores the proxy variables, and
+        # the client reads nothing else from the environment either (defence in depth).
         with httpx.Client(
             transport=_PinnedTransport(PinnedBackend(self._pinned, self._network)),
             timeout=self.timeout,
             headers={"User-Agent": USER_AGENT},
+            trust_env=False,
         ) as client:
             return self._download(client, url)
 
@@ -491,8 +523,10 @@ class HttpSource(Source):
                 for chunk in response.iter_bytes():
                     size += len(chunk)
                     if size > self.max_bytes:
-                        raise FetchError(
-                            f"{where}: larger than the {self.max_bytes}-byte cap"
+                        # How much larger is not known: the download stops here.
+                        raise TooLargeError(
+                            f"{where}: larger than the {self.max_bytes}-byte cap",
+                            size=None,
                         )
                     self._check_deadline(where, started)
                     spool.write(chunk)

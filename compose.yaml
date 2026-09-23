@@ -1,24 +1,52 @@
 # Run the service locally:
-#   cp .env.example .env          # optional; .env is git-ignored
+#   cp .env.example .env          # then set NICKEL_SERVICE_TOKEN (NICKEL_TENANT_ID is set); .env is git-ignored
 #   docker compose up --build
 #   curl http://localhost:8000/health
+#   curl -H "Authorization: Bearer $NICKEL_SERVICE_TOKEN" http://localhost:8000/jobs
+# One-off commands in the same image and data volume (docs/docker.md):
+#   docker compose run --rm nickel-connection python -m src.cli documents pull manifests/documents/<id>.yaml
+#   docker compose run --rm nickel-connection python -m src.cli documents status
 services:
   nickel-connection:
     build:
       context: .
       args:
         APP_VERSION: ${APP_VERSION:-dev}
+        # The local image can pull the Kaggle and Hugging Face manifests (docs/docker.md); the
+        # production image is built without.
+        DEV_SOURCES: "1"
     image: nickel-connection:dev
     env_file:
       - path: .env
         required: false
+    environment:
+      # A local run: the API docs on unless .env or the shell says otherwise (the service itself
+      # defaults to production, with the docs off).
+      NICKEL_ENV: ${NICKEL_ENV:-development}
+      # The tenant everything is ingested for (a UUID): required, from .env or the shell.
+      NICKEL_TENANT_ID: ${NICKEL_TENANT_ID:?set NICKEL_TENANT_ID (a UUID) in .env}
+      # The service token callers must present: required, from .env or the shell (.env.example says how
+      # to generate one). The service does not start without it.
+      NICKEL_SERVICE_TOKEN: ${NICKEL_SERVICE_TOKEN:?set NICKEL_SERVICE_TOKEN in .env (see .env.example)}
+      # Optional source credentials, passed through from your shell and ignored when empty:
+      # KAGGLE_API_TOKEN for Kaggle manifests, HF_TOKEN for higher Hugging Face rate limits.
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN:-}
+      HF_TOKEN: ${HF_TOKEN:-}
     ports:
       # This machine only; change the host part to share it on the network.
       - "127.0.0.1:${NICKEL_PORT:-8000}:8000"
-    # Hardening: read-only root filesystem, no Linux capabilities, no privilege escalation.
+    volumes:
+      # Files, receipts, the raw_data outbox, job records and download caches: /data in the
+      # container. `docker compose down -v` deletes it.
+      - connector-data:/data
+    # Hardening: read-only root filesystem (the service writes only to /data and /tmp), no Linux
+    # capabilities, no privilege escalation.
     read_only: true
     tmpfs:
       - /tmp
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
+
+volumes:
+  connector-data:

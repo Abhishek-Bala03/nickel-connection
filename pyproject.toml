@@ -23,7 +23,7 @@ dev = [
 ]
 # The sample-data sources of the development manifests (Kaggle, Hugging Face); the connector imports
 # them only when a manifest uses them. Part of dev, so uv sync and the tests have them, and not of the
-# production image (the Dockerfile exports --no-dev).
+# production image (the Dockerfile exports --no-dev); compose.yaml builds with DEV_SOURCES=1 to add them.
 dev-sources = [
     "kagglehub>=0.3",
     "huggingface-hub>=0.24",
