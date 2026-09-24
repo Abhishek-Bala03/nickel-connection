@@ -1,0 +1,28 @@
+# Breast cancer medical reports on Kaggle: 1,000 generated report PDFs (benign and malignant), patient
+# names randomised; Train (802) and Test (198) folders, each split by class 0 / 1. A short, consistent
+# layout at volume, with a label per report.
+id: kaggle-breast-cancer-reports
+description: 1,000 generated breast-cancer report PDFs (benign and malignant, train and test splits)
+stream: documents
+mode: pull
+route: L7
+fetch: kaggle
+auth:
+  type: kaggle_token
+  vault_path: null  # development: the Kaggle token comes from the environment (docs/docker.md)
+schedule:
+  class: F4  # on demand (CN-01 frequency class): the scheduler or an operator starts a pull
+formats: [pdf]
+phi: false
+owner: divij
+phase: dev  # a development source: refused in qa and production
+shadow: false  # enabled; true would store and receipt but publish nothing to raw_data
+raw_retention: forever
+contract:
+  baa: null  # public synthetic dataset: no PHI, no business associate
+  dpa: null
+license: Apache-2.0
+include: ["*.pdf"]
+max_file_bytes: 52428800
+kaggle:
+  handle: omenkj/breast-cancer-medical-reports/versions/1  # pinned

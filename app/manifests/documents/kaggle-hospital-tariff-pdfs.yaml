@@ -1,0 +1,28 @@
+# Hospital tariff documents on Kaggle: package rates, empanelment rate lists and health-insurance
+# plan PDFs published in India. No patient data; table-heavy, which makes them a good test set for
+# the Document worker downstream.
+id: kaggle-hospital-tariff-pdfs
+description: Hospital tariff, package-rate and health-insurance plan PDFs (India); table-heavy, no patient data
+stream: documents
+mode: pull
+route: L7
+fetch: kaggle
+auth:
+  type: kaggle_token
+  vault_path: null  # development: the Kaggle token comes from the environment (docs/docker.md)
+schedule:
+  class: F4  # on demand (CN-01 frequency class): the scheduler or an operator starts a pull
+formats: [pdf]
+phi: false
+owner: divij
+phase: dev  # a development source: refused in qa and production
+shadow: false  # enabled; true would store and receipt but publish nothing to raw_data
+raw_retention: forever
+contract:
+  baa: null  # public documents: no PHI, no business associate
+  dpa: null
+license: CC0-1.0 (public domain)
+include: ["*.pdf"]
+max_file_bytes: 52428800
+kaggle:
+  handle: salonishukla/hospital-tariff-documents-pdfs/versions/1  # pinned

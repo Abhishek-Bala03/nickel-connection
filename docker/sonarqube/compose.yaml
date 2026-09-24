@@ -1,0 +1,50 @@
+# SonarQube Community Build: free and self-hosted. Code and results stay on the machine that runs it.
+#   cp docker/sonarqube/.env.example docker/sonarqube/.env      # then set SONAR_DB_PASSWORD
+#   docker compose -f docker/sonarqube/compose.yaml up -d
+#   open http://localhost:9000 (first login admin / admin; SonarQube then asks for a new password)
+#   docker/sonarqube/scan.sh                                    # analyse this repository
+name: nickel-sonarqube
+
+services:
+  sonarqube:
+    image: sonarqube:26.9.0.129388-community
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://db:5432/sonar
+      SONAR_JDBC_USERNAME: sonar
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD:?set SONAR_DB_PASSWORD in docker/sonarqube/.env}
+      # Development settings, so it runs without raising the host's vm.max_map_count
+      # (not possible inside containers such as the LXD dev servers).
+      SONAR_SEARCH_JAVAADDITIONALOPTS: "-Dnode.store.allow_mmap=false"
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    ports:
+      # This machine only by default. SONAR_BIND=0.0.0.0 shares it with the team over the tailnet.
+      - "${SONAR_BIND:-127.0.0.1}:9000:9000"
+    volumes:
+      - sonarqube-data:/opt/sonarqube/data
+      - sonarqube-extensions:/opt/sonarqube/extensions
+      - sonarqube-logs:/opt/sonarqube/logs
+    restart: unless-stopped
+
+  db:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_USER: sonar
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD:?set SONAR_DB_PASSWORD in docker/sonarqube/.env}
+      POSTGRES_DB: sonar
+    volumes:
+      - sonarqube-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sonar -d sonar"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  sonarqube-data:
+  sonarqube-extensions:
+  sonarqube-logs:
+  sonarqube-db:

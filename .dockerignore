@@ -11,3 +11,7 @@ tests
 docs
 .data
 .env
+
+# SonarQube setup and scanner work files never go into the image
+docker
+.scannerwork

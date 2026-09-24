@@ -5,9 +5,15 @@ description = "Nickel connection layer (Layer 1): connectors that fetch or recei
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.141",
+    "uvicorn[standard]>=0.53",
     "httpx>=0.27",
+    # httpx's own transport library: the document connector's PinnedBackend is an httpcore backend.
+    "httpcore>=1.0",
     "pydantic>=2.7",
     "pyyaml>=6.0",
+    # The S3 File Store (NIK-2209-06): SeaweedFS in development, the bake-off's pick in production.
+    "boto3>=1.40",
 ]
 
 [dependency-groups]
@@ -15,6 +21,16 @@ dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",
     "pre-commit>=3.7",
+    # S3 for the File Store's tests (mock_aws); like all of dev, never in the image.
+    "moto[s3]>=5.1",
+    { include-group = "dev-sources" },
+]
+# The sample-data sources of the development manifests (Kaggle, Hugging Face); the connector imports
+# them only when a manifest uses them. Part of dev, so uv sync and the tests have them, and not of the
+# production image (the Dockerfile exports --no-dev); compose.yaml builds with DEV_SOURCES=1 to add them.
+dev-sources = [
+    "kagglehub>=0.3",
+    "huggingface-hub>=0.24",
 ]
 
 [tool.uv]
@@ -28,6 +44,8 @@ addopts = "--cov=app --cov-branch --cov-report=term-missing --cov-report=xml --c
 
 [tool.coverage.run]
 source = ["app"]
+# Relative paths in coverage.xml, so SonarQube can match them when it scans in Docker or CI.
+relative_files = true
 
 [tool.black]
 line-length = 88
