@@ -246,9 +246,10 @@ or `license`. The fields are read, not only validated:
   ingest ids they were held under.
 - `raw_retention`: `forever`, or a number of days such as `90d` (1 to 3650). The originals go to the
   `documents` object class either way (the class is in every object key and envelope); the value is
-  recorded on each stored object's sidecar (`raw_retention` in its `.meta.json`), and expiry is the
-  File Store lifecycle rule's job, not this connector's: nickel-connection issue #6 ("Expire stored
-  originals by raw_retention (File Store lifecycle)").
+  recorded with each stored object (`raw_retention` in its metadata: the `.meta.json` sidecar on
+  local disk, the object's own metadata in S3), and expiry is the File Store lifecycle rule's job,
+  not this connector's: nickel-connection issue #6 ("Expire stored originals by raw_retention
+  (File Store lifecycle)").
 - `max_file_bytes`: the manifest's size cap. The cap in force is the smaller of it and the service's
   `NICKEL_MAX_FILE_BYTES` ("The egress rule", below).
 
@@ -315,7 +316,7 @@ Transform layer's Dispatcher does. A message is never lost (nothing is recorded 
 it is durable) and never published twice unnoticed. The publisher's `message_id` argument is the
 message's own id (the `ingest_id`, the line's `id`), not the envelope's `idempotency_key`.
 
-The File Store writes the metadata sidecar first, then the object, each atomically (temporary file,
+The local File Store writes the metadata sidecar first, then the object, each atomically (temporary file,
 fsync, rename), so a crash never leaves an object without its metadata, and a repeated `put` of the
 same bytes is a no-op. On POSIX the directory is fsynced after each rename and after each directory
 `mkdir` created, so a power loss cannot undo a rename that `put` already returned from (a published
@@ -336,6 +337,96 @@ there (this repository's decision records are in [`docs/decisions/`](decisions/)
 extraction libraries, their settings, jobs, stores and routes, and the benchmark harness that were
 in this service's first drafts moved there with it. This service publishes `raw_data` and nothing
 else.
+
+## File Store (NIK-2209-06)
+
+Every original that passes the edge checks is stored before its receipt is written, under the key
+`object_key()` builds (`<tenant>/<class>/<sha256[:2]>/<sha256>`), in the File Store `NICKEL_FILE_STORE`
+names:
+
+- `s3`, production's default and the only store production takes: an S3 API, through boto3
+  (`src/db/file_store/s3.py`). SeaweedFS serves it in development (compose's `s3` profile,
+  [docker.md](docker.md)). Production gets the object store the SeaweedFS-vs-RustFS bake-off picks
+  (RustFS expected); nothing in the code is specific to either, so the move is a change of endpoint
+  and credentials. nickel-transform reads the same originals with the same settings and key layout.
+- `local`, the default in development and qa: a folder, `NICKEL_DATA_DIR/filestore`, with a
+  `.meta.json` sidecar next to each object ("Delivery", above). Production refuses it, so a pod that
+  sets nothing never keeps PHI on its own disk.
+
+| Setting (with `s3`) | What | Default |
+|---|---|---|
+| `NICKEL_S3_ENDPOINT_URL` | the S3 API, `http(s)://host[:port]` | none: required |
+| `NICKEL_S3_REGION` | part of each request's signature | `us-east-1` |
+| `NICKEL_S3_ORIGINALS_BUCKET` | the bucket of the originals | `originals` |
+| `NICKEL_S3_ACCESS_KEY_ID`, `NICKEL_S3_SECRET_ACCESS_KEY` | the credentials; or `NICKEL_S3_ACCESS_KEY_ID_FILE`, `NICKEL_S3_SECRET_ACCESS_KEY_FILE` naming a mounted secret (one of each pair; UTF-8, a byte order mark dropped) | none: required |
+| `NICKEL_S3_CA_BUNDLE` | a PEM bundle, for an https endpoint behind a private CA | the public CAs |
+| `NICKEL_S3_ALLOW_PUBLIC_ENDPOINT` | `true` lifts the address rule below, for an https endpoint only | `false` |
+| `NICKEL_S3_CALL_DEADLINE_SECONDS` | the most one call to the store may take, retries included | `300` (a 100 MB original at 1 MB/s, with room for retries; raise it with `NICKEL_MAX_FILE_BYTES`) |
+
+**Checked at start-up, and again for every job.** With `s3`, a wrong setting stops the service (and the
+command line, with exit code 2) before anything is contacted: a missing credential, both a value and a
+`_FILE`, a secret file that is not UTF-8, a bucket or region name S3 would refuse, a CA bundle that is
+not a file, a host name the S3 client refuses (such as `seaweed_fs`), or an endpoint outside the
+platform. Every address the endpoint's host resolves to must be loopback, private (RFC 1918, IPv6
+unique local) or on the tailnet (`100.64.0.0/10`), whatever the name ends in
+(`src/utility/endpoints.py`, the mirror image of the egress rule). In production, plain http is taken
+to loopback only: an in-cluster endpoint is https, with its private CA in `NICKEL_S3_CA_BUNDLE`, and
+there is no override for that. Only `NICKEL_S3_ALLOW_PUBLIC_ENDPOINT=true` lets a public endpoint
+through, over https, and every store opened then says so in the log. Each job checks the endpoint
+again before its first call to the store, so a name that has come to resolve elsewhere fails that job
+before anything is sent. The errors name the setting and `scheme://host[:port]`, never a credential,
+and an endpoint that carries a user or password is refused without being quoted.
+
+**Nothing from the environment.** The client takes its credentials, endpoint, region and CA bundle
+from the settings. Its botocore session has constants where botocore would read a profile, the config
+and credentials files, an `AWS_*` setting (the S3 options such as `AWS_S3_US_EAST_1_REGIONAL_ENDPOINT`
+included) or a bearer token (`AWS_BEARER_TOKEN_S3`); it never asks the instance metadata service and
+never goes through `HTTP(S)_PROXY`, so a stray variable can neither send the originals or the
+credentials elsewhere nor break the client. (botocore still names `AWS_EXECUTION_ENV` in its
+User-Agent.) The process builds one client per settings and every job shares it (boto3 clients are
+thread-safe; building one takes a third of a second). A job opens the store only when it uses it: the
+republish relay, which needs no original, never does. The client addresses buckets path-style
+(`http://<endpoint>/<bucket>/<key>`), signs with SigV4, and gives each attempt a 5 s connect and a 30 s
+read timeout, with up to 3 retries in botocore's standard mode (4 attempts in all).
+
+**A deadline on every call.** Timeouts bound each read, not a call: a store that drips its answer a
+byte at a time stays inside any read timeout. So every call (put, get, metadata) runs against
+`NICKEL_S3_CALL_DEADLINE_SECONDS`, retries included; past it the call is abandoned on its daemon thread
+and the job fails with `file store: <operation>: past the 300 s deadline`, instead of holding the job
+worker, and with it every pull and republish behind it. `get` reads the body in chunks and stops
+between them once the deadline has passed.
+
+**How it behaves.**
+
+- Write-once, by the store: `put` is one PutObject with `If-None-Match: *`, which creates the key only
+  if it is not there, atomically; a 412 means it is (the key names the bytes, so they are stored
+  already) and `put` returns False. SeaweedFS 4.47, RustFS and MinIO all take it. The bytes, the
+  content type and the metadata go in that one PUT, so there is no sidecar, and `put` refuses bytes
+  their key does not name.
+- `get` checks the bytes against the sha256 their key names, whatever the object's metadata says: an
+  object replaced behind the S3 API (SeaweedFS's filer takes writes of its own) is refused, not read.
+- Metadata is small and portable: `sha256`, `source`, `raw_retention` and `message_id_sha256`, with
+  the content type and size in the object's own headers. The message id itself stays in the receipt:
+  it is a path at the source, which can carry a patient's name, and a long one (a URL with its query)
+  would outgrow what S3 takes. S3 carries metadata in HTTP headers: ASCII only, and at most 2 KB in
+  all, which `put` enforces before anything is sent. A value that is not plain printable ASCII, or that
+  holds `=?`, is stored as an RFC 2047 encoded word, `=?UTF-8?B?<base64>?=`, the form AWS S3 itself
+  uses; `metadata()` decodes it (also when S3 hands it back split into several words or Q-encoded) and
+  lower-cases the names (SeaweedFS answers `X-Amz-Meta-Sha256`), so every value comes back exactly as it
+  was put, and a value it cannot decode is a `FileStoreError`. A reader in another service decodes it
+  the same way.
+- Errors are content-free: a `FileStoreError` says the operation and the HTTP status, the S3 error code
+  when it looks like one (letters, digits and dots; any other `<Code>` is the server's own text and is
+  dropped), or botocore's error type (`file store: put: HTTP 403 AccessDenied`, `file store: put:
+  cannot reach the store (EndpointConnectionError)`); never the key, a URL, the response body or a
+  credential. A missing object is a `MissingObjectError` (`file store: get: no such object`); a missing
+  bucket is not (`HTTP 404 NoSuchBucket`). A HEAD's 404 has no body to tell the two apart, so
+  `metadata()` then asks HeadBucket.
+
+**Failure ordering.** The ingest bridge stores the original before it writes the receipt, so a PUT that
+fails raises before there is a receipt: nothing claims the original, no envelope points at it, and the
+next run takes the item again (a receipt that was already open stays as it was). The job fails with
+the store's content-free text as its error; the command line prints it and exits with 1.
 
 ## Where the code lives
 
@@ -362,7 +453,7 @@ New with the jobs API: `db/jobs.py` (job records), `handler/documents.py` (pull,
 Under `NICKEL_DATA_DIR` (`.data` by default, `/data` in the image):
 
 ```
-filestore/<tenant>/documents/<xx>/<sha256>   the originals (+ .meta.json sidecars)
+filestore/<tenant>/documents/<xx>/<sha256>   the originals (+ .meta.json sidecars), with the local File Store
 outbox/raw_data.jsonl                        the envelopes, one JSON line each (+ raw_data.jsonl.lock)
 receipts.sqlite                              ingest_receipts (with each receipt's envelope)
 jobs.sqlite                                  job records (docs/jobs-api.md)
@@ -473,7 +564,8 @@ pre-commit hooks report locally, not a SonarQube result. Re-scan once the review
 
 | Piece | Now | Replaced by |
 |---|---|---|
-| File Store | local disk (`LocalFileStore`, `NICKEL_DATA_DIR/filestore`) | RustFS over the S3 API, the same interface (NIK-2209-06) |
+| File Store | local disk (`LocalFileStore`, `NICKEL_DATA_DIR/filestore`) in development and qa unless `NICKEL_FILE_STORE=s3`; the S3 File Store in production, which refuses local disk | the S3 File Store everywhere but a laptop (NIK-2209-06); the local one stays for the tests |
+| Object store | SeaweedFS in development, over the S3 API (compose's `s3` profile) | RustFS, pending the SeaweedFS-vs-RustFS bake-off: the same S3 client, another endpoint and credentials. The bake-off also settles immutability on the store's side: the client's `If-None-Match` keeps a PUT from replacing an original, but only a store that refuses the service's identity deletes (a deny-Delete policy) or holds objects under object lock keeps one from being removed |
 | `raw_data` | a JSONL outbox: one append per message under a cross-process lock, fsynced | Kafka with `acks=all` once it is deployed; the same at-least-once contract, message id and dedup key |
 | Receipts and job records | SQLite files under `NICKEL_DATA_DIR` | the Postgres ingest tables (schema migrations in `app/migrations` then) |
 | Service-to-service auth | the bearer token (`NICKEL_SERVICE_TOKEN`), checked before routing | mTLS between services, a K3s NetworkPolicy that lets only the scheduler and the API layer reach the pod, and the token itself issued from Vault (infra-repo work); the token stays as the application-level check underneath |

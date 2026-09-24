@@ -5,6 +5,8 @@ import re
 import tomllib
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 DEV_SOURCES = {"kagglehub", "huggingface-hub"}
 
@@ -80,3 +82,27 @@ def test_boto3_is_in_the_image_and_moto_only_in_the_tests():
     assert "boto3" in image
     assert "moto" not in image
     assert "moto" in {d["name"] for d in locked["dev-dependencies"]["dev"]}
+
+
+def test_the_development_object_store_is_pinned_off_by_default_and_commits_no_secret():
+    compose = yaml.safe_load(_read("compose.yaml"))
+    services = compose["services"]
+    for name in ("seaweedfs", "seaweedfs-init"):
+        assert services[name]["profiles"] == ["s3"]  # only with COMPOSE_PROFILES=s3
+        # A release by its digest, never a tag that moves (latest, dev) or a tag alone.
+        assert re.fullmatch(
+            r"chrislusf/seaweedfs:\d+\.\d+@sha256:[0-9a-f]{64}", services[name]["image"]
+        )
+    assert services["seaweedfs"]["image"] == services["seaweedfs-init"]["image"]
+    # Its master, volume server and filer take no credentials: loopback only. The S3 API, which
+    # checks its identities, is the one listener on the network.
+    command = services["seaweedfs"]["command"]
+    assert {"-ip.bind=127.0.0.1", "-s3.ip.bind=0.0.0.0"} <= set(command)
+    # The IAM gRPC that listens with the S3 API takes a token signed with a key made at start.
+    assert "export WEED_JWT_FILER_SIGNING_KEY" in services["seaweedfs"]["entrypoint"][2]
+    assert services["seaweedfs-init"]["network_mode"] == "service:seaweedfs"
+    # The identities are written from .env: the committed file names the variable, not a value.
+    identities = compose["configs"]["seaweedfs-identities"]["content"]
+    assert '"secretKey": "${NICKEL_S3_SECRET_ACCESS_KEY:-}"' in identities
+    environment = services["nickel-connection"]["environment"]
+    assert environment["NICKEL_FILE_STORE"] == "${NICKEL_FILE_STORE:-local}"
