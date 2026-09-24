@@ -65,3 +65,18 @@ def test_the_image_installs_the_dev_sources_only_when_asked():
         "${DEV_SOURCES:+--group dev-sources}" in dockerfile
     )
     assert 'DEV_SOURCES: "1"' in _read("compose.yaml")  # the local image
+
+
+def test_boto3_is_in_the_image_and_moto_only_in_the_tests():
+    project = tomllib.loads(_read("pyproject.toml"))
+    runtime = _names(project["project"]["dependencies"])
+    assert "boto3" in runtime
+    assert "moto" not in runtime
+    assert "moto" in _names(project["dependency-groups"]["dev"])
+    lock = tomllib.loads(_read("uv.lock"))
+    [locked] = [p for p in lock["package"] if p["name"] == "nickel-connection"]
+    # What `uv export --no-dev` installs in the image.
+    image = {d["name"] for d in locked["dependencies"]}
+    assert "boto3" in image
+    assert "moto" not in image
+    assert "moto" in {d["name"] for d in locked["dev-dependencies"]["dev"]}

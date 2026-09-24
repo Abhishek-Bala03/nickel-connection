@@ -157,6 +157,7 @@ def test_a_locked_or_vanished_file_is_one_skip_and_its_path_goes_nowhere(
     monkeypatch.setattr(DocumentManifest, "wants", wants)
     manifest_writer(folder, settings.manifest_dir)
     env = {
+        "NICKEL_ENV": "development",  # the local File Store (production takes only S3)
         "NICKEL_TENANT_ID": str(settings.tenant_id),
         "NICKEL_DATA_DIR": str(settings.data_dir),
     }

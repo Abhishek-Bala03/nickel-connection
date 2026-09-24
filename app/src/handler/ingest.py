@@ -297,10 +297,14 @@ class IngestBridge:
             key,
             item.data,
             content_type=content_type,
+            # Small and portable (S3 takes 2 KB), and no file name: the message id is a path at the
+            # source, so the object carries its hash and the receipt keeps the id itself.
             metadata={
                 "sha256": sha,
                 "source": ctx.source,
-                "message_id": item.message_id,
+                "message_id_sha256": hashlib.sha256(
+                    item.message_id.encode("utf-8")
+                ).hexdigest(),
                 "raw_retention": ctx.raw_retention,
             },
         )

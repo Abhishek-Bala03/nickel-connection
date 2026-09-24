@@ -29,6 +29,7 @@ from uuid import UUID
 from src.config import ServiceSettings
 from src.connectors.documents import ManifestError
 from src.connectors.documents.sources import FetchError
+from src.db.file_store import FileStoreError
 from src.db.jobs import INTERRUPTED, Job, JobStatus, JobStore
 from src.db.layout import DataLayout
 from src.db.outbox import PublishError
@@ -47,10 +48,17 @@ _STOP = object()
 _ERROR_CHARS = 1000
 # Errors whose message is content-free by contract: the service's own, a source that could not be
 # listed (FetchError: the manifest's locator, never a file's content), a manifest that does not load
-# (ManifestError: field names and error types, never the file's values) and a publish failure. Any
-# other exception may quote what it choked on (pydantic's ValidationError prints the rejected input,
+# (ManifestError: field names and error types, never the file's values), a publish failure and a
+# File Store failure (FileStoreError: the operation and the status, never the key). Any other
+# exception may quote what it choked on (pydantic's ValidationError prints the rejected input,
 # an OSError a path with a clinic's file name), so the record keeps its type alone.
-_OWN_ERRORS = (NickelConnectionError, FetchError, ManifestError, PublishError)
+_OWN_ERRORS = (
+    NickelConnectionError,
+    FetchError,
+    ManifestError,
+    PublishError,
+    FileStoreError,
+)
 
 
 @dataclass(frozen=True)

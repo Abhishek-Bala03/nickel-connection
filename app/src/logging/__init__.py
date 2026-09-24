@@ -16,10 +16,21 @@ import sys
 LOGGER_NAME = "nickel-connection"
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _HANDLER_NAME = "nickel-stdout"
+# The S3 client's libraries, pinned whatever the root logger says (JSON logs in K3s): botocore and
+# boto3 log requests (keys, headers) at DEBUG, and urllib3 warns with the URL it choked on.
+LIBRARY_LEVELS = {
+    "botocore": logging.WARNING,
+    "boto3": logging.WARNING,
+    "s3transfer": logging.WARNING,
+    "urllib3": logging.ERROR,
+}
 
 
 def build_logger(name: str, level: str) -> logging.Logger:
-    """A logger writing to stdout; calling it again for the same name adds no second handler."""
+    """A logger writing to stdout; calling it again for the same name adds no second handler.
+    The libraries in LIBRARY_LEVELS are pinned to theirs."""
+    for library, library_level in LIBRARY_LEVELS.items():
+        logging.getLogger(library).setLevel(library_level)
     log = logging.getLogger(name)
     log.setLevel(level)
     log.propagate = False

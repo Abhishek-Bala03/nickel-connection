@@ -23,7 +23,7 @@ from src.connectors.documents import (
     ManifestError,
     RunSummary,
 )
-from src.db.file_store import LocalFileStore
+from src.db.file_store import open_file_store
 from src.db.layout import DataLayout
 from src.db.outbox import JsonlOutbox, PublishError
 from src.db.receipts import Receipt, ReceiptStatus, ReceiptStore
@@ -70,7 +70,7 @@ def ingest_bridge(settings: ServiceSettings) -> Iterator[IngestBridge]:
     with ReceiptStore(layout.receipts_db) as receipts:
         yield IngestBridge(
             tenant_id=tenant,
-            store=LocalFileStore(layout.filestore),
+            store=open_file_store(settings),
             publisher=JsonlOutbox(layout.outbox),
             receipts=receipts,
             max_bytes=settings.max_file_bytes,

@@ -1,7 +1,7 @@
-"""Content-addressed, write-once File Store on local disk, for development.
+"""Content-addressed, write-once File Store on local disk, for development and tests.
 
-RustFS (S3 API) replaces it later behind the same interface. Metadata sits next to each object in a
-``.meta.json`` sidecar, the way S3 keeps it on the object.
+``S3FileStore`` is the same interface over the S3 API (``NICKEL_FILE_STORE=s3``). Metadata sits next
+to each object in a ``.meta.json`` sidecar, the way S3 keeps it on the object.
 
 Both files are written atomically (a temp file next to the target, fsync, then rename), sidecar first
 and object second. A crash between the two leaves a sidecar with no object, which the next ``put``
@@ -24,6 +24,8 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+from .base import key_parts
 
 META_SUFFIX = ".meta.json"
 # Whether directory entries need an explicit fsync here (POSIX). The tests set both values.
@@ -81,15 +83,7 @@ class LocalFileStore:
         self.root = Path(root)
 
     def _path(self, key: str) -> Path:
-        parts = key.split("/")
-        if (
-            not key
-            or key.startswith("/")
-            or "\\" in key
-            or any(part in ("", ".", "..") for part in parts)
-        ):
-            raise ValueError(f"invalid object key: {key!r}")
-        return self.root.joinpath(*parts)
+        return self.root.joinpath(*key_parts(key))
 
     def put(
         self, key: str, data: bytes, *, content_type: str, metadata: Mapping[str, str]

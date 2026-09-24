@@ -326,7 +326,15 @@ def test_api_docs_are_on_in_development_only(environment, status):
 
 
 def test_api_docs_are_off_unless_the_environment_is_set_explicitly():
-    unset = load_settings(CONF_FILE, environ={})  # a deployment that sets no NICKEL_ENV
+    # A deployment that sets no NICKEL_ENV (it then needs the S3 File Store, here on loopback).
+    unset = load_settings(
+        CONF_FILE,
+        environ={
+            "NICKEL_S3_ENDPOINT_URL": "http://127.0.0.1:8333",
+            "NICKEL_S3_ACCESS_KEY_ID": "k",
+            "NICKEL_S3_SECRET_ACCESS_KEY": "s",
+        },
+    )
     client = TestClient(_service(environment=unset.environment), headers=AUTH)
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == 404
