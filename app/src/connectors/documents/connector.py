@@ -205,7 +205,6 @@ class DocumentConnector:
             formats=tuple(manifest.formats),
             trace_id=self.trace_id,
             shadow=manifest.shadow,
-            raw_retention=manifest.raw_retention,
         )
 
     def run(self, limit: int | None = None) -> RunSummary:

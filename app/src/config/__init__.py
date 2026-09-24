@@ -133,8 +133,8 @@ def _secret(name: str, value: str, secret_file: str) -> str:
         # utf-8-sig: a byte order mark (Windows editors, PowerShell) is not part of the secret.
         return Path(secret_file).read_text(encoding="utf-8-sig").strip()
     except OSError as exc:
-        # The OS message names the file, not what is in it.
-        raise ValueError(f"{name}_FILE cannot be read: {exc}") from exc
+        # The error's type only: the OS message names the file's path.
+        raise ValueError(f"{name}_FILE cannot be read: {type(exc).__name__}") from None
     except UnicodeDecodeError:
         # Its message would quote a byte of the secret.
         raise ValueError(f"{name}_FILE is not UTF-8 text") from None
@@ -183,8 +183,9 @@ def check_s3_endpoint(s3: S3Settings) -> None:
 
 def _s3_settings(get: Callable[..., str], environment: str) -> S3Settings:
     """``[FILE_STORE]`` for the S3 backend, every value checked before anything is contacted: the
-    endpoint (``check_s3_endpoint``; https off loopback in production), the bucket and the region by
-    what S3 accepts, both credentials present, each from one source, and the call deadline.
+    endpoint (``check_s3_endpoint``; https off loopback everywhere but development), the bucket and
+    the region by what S3 accepts, both credentials present, each from one source (outside
+    development, a mounted file: never the variable itself), and the call deadline.
     """
     endpoint = get("FILE_STORE", "s3_endpoint_url")
     if not endpoint:
@@ -213,6 +214,16 @@ def _s3_settings(get: Callable[..., str], environment: str) -> S3Settings:
             ("NICKEL_S3_SECRET_ACCESS_KEY", "s3_secret_access_key"),
         )
     }
+    if environment != "development":
+        for name, option in (
+            ("NICKEL_S3_ACCESS_KEY_ID", "s3_access_key_id"),
+            ("NICKEL_S3_SECRET_ACCESS_KEY", "s3_secret_access_key"),
+        ):
+            if get("FILE_STORE", option):
+                raise ValueError(
+                    f"{name} is for development: in {environment} the S3 credentials come "
+                    f"from {name}_FILE (a Vault or CSI mount), never the variable itself"
+                )
     missing = [name for name, value in credentials.items() if not value]
     if missing:
         raise ValueError(
@@ -230,7 +241,10 @@ def _s3_settings(get: Callable[..., str], environment: str) -> S3Settings:
         secret_access_key=credentials["NICKEL_S3_SECRET_ACCESS_KEY"],
         ca_bundle=Path(ca_bundle) if ca_bundle else None,
         allow_public_endpoint=allow_public,
-        require_https=environment == "production",
+        # Plain http to a private name is for a development stack only: anywhere else a name that
+        # resolves elsewhere later could take the originals, and TLS (the name's certificate) is
+        # what stops that. Loopback stays allowed.
+        require_https=environment != "development",
         call_deadline_s=_positive_int(
             "NICKEL_S3_CALL_DEADLINE_SECONDS",
             get("FILE_STORE", "s3_call_deadline_seconds"),

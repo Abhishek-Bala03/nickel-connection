@@ -20,8 +20,14 @@ bucket (``http://<endpoint>/<bucket>/<key>``).
 - Every call runs against a wall-clock deadline (``NICKEL_S3_CALL_DEADLINE_SECONDS``), retries
   included: within it the client retries up to 3 times (standard mode: 4 attempts in all), each
   attempt with its connect and read timeouts; past it the call is abandoned on its daemon thread and
-  the job fails, however slowly the store drips its answer. ``get`` reads the body in chunks and
-  stops between them once the deadline has passed.
+  the job fails, however slowly the store drips its answer. An abandoned call does not run on: a
+  ``put``'s body stops the upload itself once the deadline has passed (``_Upload``), and ``get``
+  reads in chunks and stops between them. While ``_ABANDONED_LIMIT`` abandoned calls are still open,
+  a new call fails at once instead of adding a thread, a socket and an object's bytes to them.
+- ``get`` takes ``max_bytes``: an object larger than that is refused before its body is read, and
+  the body is read into one buffer, never held twice.
+- Two jobs racing to create one key may get 409 (ConditionalRequestConflict, a conditional write in
+  progress): ``put`` tries once more, and a 412 then means the other one stored it.
 - Every failure is a FileStoreError whose text names the operation and the HTTP status and S3 error
   code (only when it looks like one), or botocore's error type: never the key, the endpoint's URL
   (botocore's own messages quote the URL they failed on, the key in it), the response body or a
@@ -37,9 +43,9 @@ job checks the endpoint again before its first call (``src.config.check_s3_endpo
 
 from __future__ import annotations
 
-import base64
 import functools
 import hashlib
+import io
 import os
 import re
 import threading
@@ -59,8 +65,9 @@ from botocore.exceptions import ConnectionError as BotoConnectionError
 from botocore.tokens import TokenProviderChain
 
 from src.config import S3Settings, check_s3_endpoint
+from src.logging import logger
 
-from .base import FileStoreError, MissingObjectError, key_parts
+from .base import FileStoreError, MissingObjectError, encode_metadata, key_parts
 
 T = TypeVar("T")
 
@@ -77,15 +84,66 @@ CLIENT_CONFIG = Config(
 )
 # get() reads the body this much at a time, the deadline checked in between.
 _CHUNK = 256 * 1024
-_METADATA_LIMIT = 2048  # bytes of user metadata S3 takes: names and values
 # An S3 error code worth quoting; any other <Code> is the server's own text, and is dropped.
 _CODE = re.compile(r"[A-Za-z0-9.]{1,64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-# Printable ASCII with single spaces inside and none at either end: a request signature's canonical
-# form trims and collapses the spaces of a header value, so any other value is encoded.
-_PLAIN = re.compile(r"[!-~]+(?: [!-~]+)*")
-# What S3 keeps of a metadata name: it lower-cases names, so only lower-case ones come back the same.
-_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
+# Calls past their deadline whose threads are still open; while this many are, a new call fails at
+# once rather than pile another thread, socket and object on a store that has stopped answering.
+_ABANDONED_LIMIT = 4
+# How long put waits before its one retry of a 409 (a conditional write to the key in progress).
+_CONFLICT_PAUSE_S = 0.2
+
+
+class _Abandoned:
+    """The calls abandoned at their deadline whose threads have not ended yet (module docstring)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.open = 0
+
+    def refuse_if_full(self, operation: str) -> None:
+        with self._lock:
+            if self.open >= _ABANDONED_LIMIT:
+                raise FileStoreError(
+                    f"file store: {operation}: {self.open} earlier calls are still open past "
+                    "their deadline"
+                )
+
+    def add(self) -> int:
+        with self._lock:
+            self.open += 1
+            return self.open
+
+    def remove(self) -> None:
+        with self._lock:
+            self.open -= 1
+
+
+_ABANDONED = _Abandoned()
+
+
+class _Upload(io.BytesIO):
+    """A ``put``'s body: the object's bytes, read by botocore a chunk at a time, that refuses to hand
+    out another chunk once the call's deadline has passed. An upload its caller abandoned therefore
+    stops on its own, and its thread lets go of the socket and the bytes, instead of trickling on
+    to a slow store after the job has failed."""
+
+    def __init__(
+        self,
+        data: bytes,
+        deadline_at: float,
+        seconds: float,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(data)
+        self._deadline_at = deadline_at
+        self._seconds = seconds
+        self._clock = clock
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._clock() > self._deadline_at:
+            raise _deadline("put", self._seconds)
+        return super().read(size)
 
 
 def _isolated_session() -> botocore.session.Session:
@@ -134,10 +192,14 @@ def _deadline(operation: str, seconds: float) -> FileStoreError:
 
 def _within(seconds: float, operation: str, call: Callable[[], T]) -> T:
     """``call()`` on a daemon thread, waited for at most ``seconds``. Past that the call is
-    abandoned (its thread ends when the store answers or its socket times out, and never holds the
-    process open) and the caller gets a FileStoreError."""
+    abandoned (its thread ends when the store answers, its socket times out, or its upload stops at
+    the deadline, and never holds the process open) and the caller gets a FileStoreError. While
+    ``_ABANDONED_LIMIT`` abandoned calls are still open, a new one fails at once."""
+    _ABANDONED.refuse_if_full(operation)
     outcome: dict[str, Any] = {}
     finished = threading.Event()
+    state = threading.Lock()
+    abandoned = False
 
     def run() -> None:
         try:
@@ -145,11 +207,24 @@ def _within(seconds: float, operation: str, call: Callable[[], T]) -> T:
         except Exception as exc:  # handed to the caller below
             outcome["error"] = exc
         finally:
-            finished.set()
+            with state:
+                finished.set()
+                if abandoned:
+                    _ABANDONED.remove()
 
     threading.Thread(target=run, name=f"file-store-{operation}", daemon=True).start()
     if not finished.wait(seconds):
-        raise _deadline(operation, seconds)
+        with state:
+            if not finished.is_set():
+                abandoned = True
+                still_open = _ABANDONED.add()
+                logger.warning(
+                    "file store: %s abandoned past its %g s deadline (%d open)",
+                    operation,
+                    seconds,
+                    still_open,
+                )
+                raise _deadline(operation, seconds)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
@@ -159,25 +234,23 @@ def _read_within(
     body: Any,
     deadline_at: float,
     seconds: float,
+    max_bytes: int | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> bytes:
-    """The whole body, a chunk at a time, stopping between chunks once the deadline has passed:
-    a get abandoned by its caller stops reading instead of draining the rest of the object.
-    """
-    chunks = []
+    """The whole body, a chunk at a time into one buffer, stopping between chunks once the deadline
+    has passed (a get abandoned by its caller stops reading instead of draining the rest of the
+    object) or once it holds more than ``max_bytes``."""
+    buffer = io.BytesIO()
     with closing(body):
         while chunk := body.read(_CHUNK):
-            chunks.append(chunk)
+            buffer.write(chunk)
+            if max_bytes is not None and buffer.tell() > max_bytes:
+                raise FileStoreError(
+                    f"file store: get: over the {max_bytes} bytes asked"
+                )
             if clock() > deadline_at:
                 raise _deadline("get", seconds)
-    return b"".join(chunks)
-
-
-def _encode(value: str) -> str:
-    if _PLAIN.fullmatch(value) and "=?" not in value:
-        return value
-    encoded = base64.b64encode(value.encode("utf-8")).decode("ascii")
-    return f"=?UTF-8?B?{encoded}?="
+    return buffer.getvalue()
 
 
 def _decode(value: str) -> str:
@@ -186,21 +259,6 @@ def _decode(value: str) -> str:
     if "=?" not in value:
         return value
     return str(make_header(decode_header(value)))
-
-
-def _encode_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
-    for name in metadata:
-        if not _NAME.fullmatch(name):
-            raise ValueError(
-                f"metadata name {name!r} is not lower-case ASCII letters, digits, _ and -"
-            )
-    encoded = {name: _encode(value) for name, value in metadata.items()}
-    size = sum(len(name) + len(value) for name, value in encoded.items())
-    if size > _METADATA_LIMIT:
-        raise FileStoreError(
-            f"file store: put: {size} bytes of metadata, over the {_METADATA_LIMIT} S3 takes"
-        )
-    return encoded
 
 
 def _decode_metadata(headers: Mapping[str, str]) -> dict[str, str]:
@@ -278,41 +336,61 @@ class S3FileStore:
                 self.settings.call_deadline_s, operation, lambda: call(self._open())
             )
         except (BotoCoreError, ClientError) as exc:
-            raise _failure(operation, exc) from exc
+            # from None: a ClientError's text carries the server's <Message>.
+            raise _failure(operation, exc) from None
 
     def put(
         self, key: str, data: bytes, *, content_type: str, metadata: Mapping[str, str]
     ) -> bool:
         if hashlib.sha256(data).hexdigest() != _content_sha(key):
             raise ValueError("the bytes are not the ones their key names")
-        headers = _encode_metadata(metadata)
+        headers = encode_metadata(metadata)
+        seconds = self.settings.call_deadline_s
+        deadline_at = time.monotonic() + seconds
+
+        def attempt(client: Any) -> bool:
+            client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=_Upload(data, deadline_at, seconds),
+                ContentType=content_type,
+                Metadata=headers,
+                IfNoneMatch="*",
+            )
+            return True
 
         def create(client: Any) -> bool:
-            try:
-                client.put_object(
-                    Bucket=self.bucket,
-                    Key=key,
-                    Body=data,
-                    ContentType=content_type,
-                    Metadata=headers,
-                    IfNoneMatch="*",
-                )
-            except ClientError as exc:
-                if _status(exc) == 412:  # PreconditionFailed: the key is there already
-                    return False
-                raise
-            return True
+            for tries_left in (1, 0):
+                try:
+                    return attempt(client)
+                except ClientError as exc:
+                    if (
+                        _status(exc) == 412
+                    ):  # PreconditionFailed: the key is there already
+                        return False
+                    # 409: another conditional write to the key is in progress (its bytes are
+                    # these bytes): once more, when a 412 says whether it landed.
+                    if _status(exc) != 409 or not tries_left:
+                        raise
+                    time.sleep(_CONFLICT_PAUSE_S)
+            raise AssertionError("unreachable")  # pragma: no cover
 
         return self._call("put", create)
 
-    def get(self, key: str) -> bytes:
+    def get(self, key: str, *, max_bytes: int | None = None) -> bytes:
         expected = _content_sha(key)
         seconds = self.settings.call_deadline_s
         deadline_at = time.monotonic() + seconds
 
         def read(client: Any) -> bytes:
             response = client.get_object(Bucket=self.bucket, Key=key)
-            return _read_within(response["Body"], deadline_at, seconds)
+            length = response.get("ContentLength")
+            if max_bytes is not None and length is not None and length > max_bytes:
+                response["Body"].close()
+                raise FileStoreError(
+                    f"file store: get: over the {max_bytes} bytes asked"
+                )
+            return _read_within(response["Body"], deadline_at, seconds, max_bytes)
 
         data = self._call("get", read)
         if hashlib.sha256(data).hexdigest() != expected:
@@ -341,10 +419,12 @@ class S3FileStore:
         found = self._call("metadata", head)
         try:
             decoded = _decode_metadata(found.get("Metadata", {}))
-        except (ValueError, LookupError, HeaderParseError) as exc:
+        except (ValueError, LookupError, HeaderParseError):
             raise FileStoreError(
                 "file store: metadata: a value that cannot be decoded"
-            ) from exc
+            ) from None
+        if found.get("ContentLength") is None:
+            raise FileStoreError("file store: metadata: the store gave no length")
         return {
             "content_type": found.get("ContentType"),
             "bytes": found["ContentLength"],

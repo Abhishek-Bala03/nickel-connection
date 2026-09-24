@@ -49,3 +49,40 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+
+  s3-conformance:
+    # The File Store's write-once rests on the store honouring If-None-Match: the live conformance
+    # tests (tests/test_s3_conformance.py) against compose's SeaweedFS, the development store. The
+    # PL-06 bake-off runs the same against each candidate, with S3_CONFORMANCE_EXPECT_DELETE_DENIED=1.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install
+        run: uv sync --frozen
+
+      - name: SeaweedFS from compose.yaml (the s3 profile), with a fresh secret
+        env:
+          # compose.yaml requires these for the service, which this job does not start
+          NICKEL_SERVICE_TOKEN: ci-conformance-not-a-service-token-0123456789
+          NICKEL_TENANT_ID: 0192a3b4-0000-7000-8000-000000000001
+        run: |
+          secret="$(openssl rand -hex 24)"
+          echo "::add-mask::$secret"
+          echo "S3_CONFORMANCE_SECRET_ACCESS_KEY=$secret" >> "$GITHUB_ENV"
+          export NICKEL_S3_SECRET_ACCESS_KEY="$secret"
+          docker compose --profile s3 up -d --wait seaweedfs
+          docker compose --profile s3 run --rm -T seaweedfs-init
+
+      - name: Live conformance
+        env:
+          S3_CONFORMANCE_ENDPOINT: http://127.0.0.1:8333
+          S3_CONFORMANCE_ACCESS_KEY_ID: nickel-connection
+          S3_CONFORMANCE_BUCKET: originals
+        run: uv run pytest -p no:cacheprovider --no-cov -rxs tests/test_s3_conformance.py

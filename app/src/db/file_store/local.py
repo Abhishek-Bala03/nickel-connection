@@ -1,6 +1,9 @@
 """Content-addressed, write-once File Store on local disk, for development and tests.
 
-``S3FileStore`` is the same interface over the S3 API (``NICKEL_FILE_STORE=s3``). Metadata sits next
+``S3FileStore`` is the same interface over the S3 API (``NICKEL_FILE_STORE=s3``), and this store
+applies its contract: ``put`` refuses bytes the key does not name and metadata the S3 store would
+refuse (``base.encode_metadata``), ``get`` checks the bytes against the key's sha256 and takes
+``max_bytes``, and a missing object is a MissingObjectError that names no path. Metadata sits next
 to each object in a ``.meta.json`` sidecar, the way S3 keeps it on the object.
 
 Both files are written atomically (a temp file next to the target, fsync, then rename), sidecar first
@@ -18,6 +21,7 @@ itself, so it is skipped there.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -25,7 +29,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .base import key_parts
+from .base import FileStoreError, MissingObjectError, encode_metadata, key_parts
 
 META_SUFFIX = ".meta.json"
 # Whether directory entries need an explicit fsync here (POSIX). The tests set both values.
@@ -89,6 +93,9 @@ class LocalFileStore:
         self, key: str, data: bytes, *, content_type: str, metadata: Mapping[str, str]
     ) -> bool:
         path = self._path(key)
+        if hashlib.sha256(data).hexdigest() != key_parts(key)[-1]:
+            raise ValueError("the bytes are not the ones their key names")
+        encode_metadata(metadata)  # what S3 would refuse, refused here too
         if path.is_file():
             return False
         _make_directory(path.parent)
@@ -101,11 +108,26 @@ class LocalFileStore:
         _write_atomically(path, data)
         return True
 
-    def get(self, key: str) -> bytes:
-        return self._path(key).read_bytes()
+    def get(self, key: str, *, max_bytes: int | None = None) -> bytes:
+        path = self._path(key)
+        try:
+            if max_bytes is not None and path.stat().st_size > max_bytes:
+                raise FileStoreError(
+                    f"file store: get: over the {max_bytes} bytes asked"
+                )
+            data = path.read_bytes()
+        except FileNotFoundError:  # its message names the path
+            raise MissingObjectError("file store: get: no such object") from None
+        if hashlib.sha256(data).hexdigest() != key_parts(key)[-1]:
+            raise FileStoreError(
+                "file store: get: the bytes are not the ones their key names"
+            )
+        return data
 
     def metadata(self, key: str) -> dict[str, Any]:
         path = self._path(key)
-        return json.loads(
-            path.with_name(path.name + META_SUFFIX).read_text(encoding="utf-8")
-        )
+        try:
+            text = path.with_name(path.name + META_SUFFIX).read_text(encoding="utf-8")
+        except FileNotFoundError:  # its message names the path
+            raise MissingObjectError("file store: metadata: no such object") from None
+        return json.loads(text)

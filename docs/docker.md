@@ -78,10 +78,17 @@ NICKEL_S3_SECRET_ACCESS_KEY=...   # python -c "import secrets; print(secrets.tok
 
 and run `docker compose up --build` as above.
 
-- compose writes SeaweedFS's identities file (`/etc/seaweedfs/s3.json`) from `.env`: one identity,
-  `nickel-connection`, with the access key (`NICKEL_S3_ACCESS_KEY_ID`, default `nickel-connection`) and
-  the secret, allowed to read and write the originals bucket and nothing else. No committed file holds
-  the secret, and `seaweedfs` refuses to start without one.
+- SeaweedFS writes its identities file (`/etc/seaweedfs/s3.json`, on a tmpfs) when it starts, from
+  compose's secret: one identity, `nickel-connection`, with the access key (`NICKEL_S3_ACCESS_KEY_ID`,
+  default `nickel-connection`) and the secret, allowed to read and write the originals bucket and
+  nothing else. The secret reaches it as `/run/secrets/s3-secret-access-key`, so its section of
+  `docker compose config` names the variable and prints no value. No committed file holds the secret,
+  and `seaweedfs` refuses to start without one. The connection service takes the same secret as
+  `NICKEL_S3_SECRET_ACCESS_KEY` (its root filesystem is read-only, and compose mounts a secret from
+  the environment only into a writable one): development only, since qa and production take the
+  S3 credentials from mounted files alone.
+- `seaweedfs` keeps no Linux capabilities but the three its image needs to hand `/data` to its
+  `seaweed` user and run as that user (`CHOWN`, `SETUID`, `SETGID`), and cannot gain privileges.
 - The S3 identity guards the S3 API only. SeaweedFS's master (9333), volume server (8080) and filer
   (8888) take no credentials at all, and its "Write" action also lets the identity delete, so the
   master, volume server and filer listen on the container's loopback only (`-ip.bind=127.0.0.1`) and
@@ -94,8 +101,9 @@ and run `docker compose up --build` as above.
   `seaweedfs` container's network namespace (`network_mode: service:seaweedfs`) to reach the master on
   loopback. Running it again changes nothing. The connection service starts once it has finished.
 - The connection service reaches SeaweedFS at `http://seaweedfs:8333`, a private address on the compose
-  network, as the endpoint rule wants; compose runs it as development, which takes plain http there
-  (production takes https off loopback, and refuses the local File Store). Outside Docker, `uv run --env-file .env` reaches it at
+  network, as the endpoint rule wants; compose runs it as development, the one environment that
+  takes plain http there (qa and production take https off loopback, and production refuses the local
+  File Store). Outside Docker, `uv run --env-file .env` reaches it at
   `http://127.0.0.1:8333` (`NICKEL_S3_ENDPOINT_URL` in `.env.example`; the host port is
   `NICKEL_S3_PORT`, on this machine only).
 - Its data is in the `seaweedfs-data` volume, which `docker compose down -v` deletes with the rest.

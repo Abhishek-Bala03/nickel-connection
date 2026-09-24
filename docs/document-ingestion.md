@@ -245,11 +245,12 @@ or `license`. The fields are read, not only validated:
   published. Once the manifest says `shadow: false`, the next run publishes the held items under the
   ingest ids they were held under.
 - `raw_retention`: `forever`, or a number of days such as `90d` (1 to 3650). The originals go to the
-  `documents` object class either way (the class is in every object key and envelope); the value is
-  recorded with each stored object (`raw_retention` in its metadata: the `.meta.json` sidecar on
-  local disk, the object's own metadata in S3), and expiry is the File Store lifecycle rule's job,
-  not this connector's: nickel-connection issue #6 ("Expire stored originals by raw_retention
-  (File Store lifecycle)").
+  `documents` object class either way (the class is in every object key and envelope). The value
+  stays with the source: an object is shared by every receipt that names its bytes (two sources
+  can deliver the same PDF), so it carries facts about the content only, and expiry keeps an
+  object until the longest `raw_retention` among the receipts that point at it has passed. That
+  is the File Store lifecycle rule's job, not this connector's: nickel-connection issue #6
+  ("Expire stored originals by raw_retention (File Store lifecycle)").
 - `max_file_bytes`: the manifest's size cap. The cap in force is the smaller of it and the service's
   `NICKEL_MAX_FILE_BYTES` ("The egress rule", below).
 
@@ -369,9 +370,15 @@ command line, with exit code 2) before anything is contacted: a missing credenti
 not a file, a host name the S3 client refuses (such as `seaweed_fs`), or an endpoint outside the
 platform. Every address the endpoint's host resolves to must be loopback, private (RFC 1918, IPv6
 unique local) or on the tailnet (`100.64.0.0/10`), whatever the name ends in
-(`src/utility/endpoints.py`, the mirror image of the egress rule). In production, plain http is taken
-to loopback only: an in-cluster endpoint is https, with its private CA in `NICKEL_S3_CA_BUNDLE`, and
-there is no override for that. Only `NICKEL_S3_ALLOW_PUBLIC_ENDPOINT=true` lets a public endpoint
+(`src/utility/endpoints.py`, the mirror image of the egress rule). Outside development (qa and
+production), plain http is taken to loopback only: an in-cluster endpoint is https, with its
+private CA in `NICKEL_S3_CA_BUNDLE`, and there is no override for that. TLS is what binds the
+connection to the name that was checked: the check resolves the name, and the client resolves it
+again for every new connection, so over plain http a name that has come to resolve elsewhere
+would get the originals. That leaves a development stack alone (compose's `http://seaweedfs:8333`)
+with that window, and the deployment closes the rest with a NetworkPolicy egress rule that lets
+the pod reach only the store (infra). Outside development the credentials come from the `_FILE`
+variants only (a Vault or CSI mount); the variables themselves are refused there. Only `NICKEL_S3_ALLOW_PUBLIC_ENDPOINT=true` lets a public endpoint
 through, over https, and every store opened then says so in the log. Each job checks the endpoint
 again before its first call to the store, so a name that has come to resolve elsewhere fails that job
 before anything is sent. The errors name the setting and `scheme://host[:port]`, never a credential,
@@ -393,8 +400,14 @@ read timeout, with up to 3 retries in botocore's standard mode (4 attempts in al
 byte at a time stays inside any read timeout. So every call (put, get, metadata) runs against
 `NICKEL_S3_CALL_DEADLINE_SECONDS`, retries included; past it the call is abandoned on its daemon thread
 and the job fails with `file store: <operation>: past the 300 s deadline`, instead of holding the job
-worker, and with it every pull and republish behind it. `get` reads the body in chunks and stops
-between them once the deadline has passed.
+worker, and with it every pull and republish behind it. An abandoned call does not run on: a `put`'s
+body refuses to hand out another chunk once the deadline has passed, so the upload stops itself,
+and `get` reads in chunks and stops between them. While four abandoned calls are still open, a new
+call fails at once (`file store: <operation>: 4 earlier calls are still open past their
+deadline`) instead of piling another thread, socket and object on a store that has stopped
+answering, and each abandoned call is logged with the count. `get` also takes `max_bytes`: an
+object larger than that is refused before its body is read, and the body goes into one buffer,
+never held twice.
 
 **How it behaves.**
 
@@ -402,13 +415,19 @@ between them once the deadline has passed.
   if it is not there, atomically; a 412 means it is (the key names the bytes, so they are stored
   already) and `put` returns False. SeaweedFS 4.47, RustFS and MinIO all take it. The bytes, the
   content type and the metadata go in that one PUT, so there is no sidecar, and `put` refuses bytes
-  their key does not name.
+  their key does not name. Two jobs racing on one key may get 409 (`ConditionalRequestConflict`,
+  a conditional write in progress): `put` tries once more, and a 412 then means the other one
+  stored it. Whether a store honours `If-None-Match` at all is tested live, not assumed:
+  `tests/test_s3_conformance.py`, run by CI's `s3-conformance` job against compose's SeaweedFS and
+  by the PL-06 bake-off against each candidate. It also asks that the service's identity cannot
+  delete an original: SeaweedFS's "Write" can, so there that check is an expected failure, and the
+  store the bake-off picks must pass it (object lock, or a policy that denies DeleteObject).
 - `get` checks the bytes against the sha256 their key names, whatever the object's metadata says: an
   object replaced behind the S3 API (SeaweedFS's filer takes writes of its own) is refused, not read.
-- Metadata is small and portable: `sha256`, `source`, `raw_retention` and `message_id_sha256`, with
-  the content type and size in the object's own headers. The message id itself stays in the receipt:
-  it is a path at the source, which can carry a patient's name, and a long one (a URL with its query)
-  would outgrow what S3 takes. S3 carries metadata in HTTP headers: ASCII only, and at most 2 KB in
+- Metadata holds facts about the content only: its `sha256`, with the content type and size in the
+  object's own headers. The object is shared by every receipt that names its bytes, so who sent it,
+  under which message id (a path at the source, which can carry a patient's name) and for how long
+  it is kept stay with the receipts. S3 carries metadata in HTTP headers: ASCII only, and at most 2 KB in
   all, which `put` enforces before anything is sent. A value that is not plain printable ASCII, or that
   holds `=?`, is stored as an RFC 2047 encoded word, `=?UTF-8?B?<base64>?=`, the form AWS S3 itself
   uses; `metadata()` decodes it (also when S3 hands it back split into several words or Q-encoded) and
@@ -575,7 +594,7 @@ pre-commit hooks report locally, not a SonarQube result. Re-scan once the review
 | Manifest fields | a CN-01 subset: no `endpoints`, `rate_limit` or `expectations`; `schedule` has its `class` only; `formats` is the list of formats the edge check sniffs | CN-01's full shape: `endpoints` (which generate the OPA egress allow-list), `rate_limit`, `expectations: {freshness_slo}`, `schedule: {class, interval, overlap, backfill}` and `formats: {schema_id, validate}` |
 | `schedule: on_demand` | the old string form, read as `{class: F4}` with a deprecation warning, for the manifests still on disk | refused in the next release, like any other string |
 | Source credentials | `KAGGLE_API_TOKEN` and `HF_TOKEN` from the environment, read by the SDKs themselves; dev sources only (a token beyond `dev` needs `auth.vault_path`, and the SDK sources are `dev` only) | the connector runner (CN-09) reading `auth.vault_path` from Vault |
-| `raw_retention` expiry | recorded on each stored object's sidecar; nothing expires yet | the File Store lifecycle rule that expires originals by it: nickel-connection issue #6 |
+| `raw_retention` expiry | kept with each receipt's source (its manifest), never on the shared object; nothing expires yet | the File Store lifecycle rule: an object goes once the longest `raw_retention` among the receipts that point at it has passed (nickel-connection issue #6) |
 | The `too_large` marker's key | a surrogate (`too_large_key`) in `payload_sha256`, since the SQLite table's unique key needs a value there; the API shows null | the Postgres ingest tables: a nullable `payload_sha256` (NULL for a marker) and a partial unique index on (tenant_id, source, message_id) where it is NULL; [decision record 0002](decisions/0002-too-large-receipts-for-pulls.md) |
 | Quarantine | an edge reject or an over-cap file keeps a receipt and not its bytes (`rejected`: not stored; `too_large`: not fetched) | a quarantine object class that keeps them for inspection and replay, with `raw.dlq` and the replay tool: nickel-connection issue #4 (a pull's `too_large` receipt is what a replay of an over-cap file hangs on) |
 | `idempotency_key` formula | sha256 over tenant, source, message id and payload hash | what [decision record 0001](decisions/0001-idempotency-key.md) decides (Proposed: D-00's formula, the document's version in its message id) |

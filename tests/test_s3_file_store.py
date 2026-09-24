@@ -1069,9 +1069,14 @@ def test_a_put_that_fails_leaves_no_receipt_and_the_next_run_stores_it(
     assert (again.outcome, again.new_object) == (Outcome.PUBLISHED, True)
     assert receipts.counts(tenant_id=TENANT) == {"published": 1}
     assert store.get(again.payload_ref) == pdf_bytes
-    # The object carries the message id's hash, never the id (a path at the source).
+    # The object carries facts about the content only: nothing of the message (a path at the
+    # source), nor the source or its retention (they stay with the receipts).
     metadata = store.metadata(again.payload_ref)
-    assert metadata["message_id_sha256"] == _sha(b"local:docs/a.pdf")
+    assert metadata == {
+        "sha256": _sha(pdf_bytes),
+        "content_type": "application/pdf",
+        "bytes": len(pdf_bytes),
+    }
     assert "local:docs/a.pdf" not in json.dumps(metadata)
 
 
@@ -1108,6 +1113,7 @@ def test_the_command_line_says_the_store_refused_and_exits_1(
     credentials, _ = _iam_user(*READ_ONLY)
     manifest = manifest_writer(pdf_folder)
     env = {
+        "NICKEL_ENV": "development",  # the credentials as variables: development only
         "NICKEL_TENANT_ID": TENANT,
         "NICKEL_DATA_DIR": str(tmp_path / "data"),
         "NICKEL_FILE_STORE": "s3",
@@ -1121,3 +1127,121 @@ def test_the_command_line_says_the_store_refused_and_exits_1(
     assert capsys.readouterr().err == "error: file store: put: HTTP 403 AccessDenied\n"
     with ReceiptStore(tmp_path / "data" / "receipts.sqlite") as receipts:
         assert receipts.counts(tenant_id=TENANT) == {}
+
+
+# ── Bounds: abandoned calls, the upload's deadline, max_bytes, a 409 (review of #7) ──
+@pytest.fixture(autouse=True)
+def no_abandoned_call_outlives_its_test():
+    """Calls a test abandons end with it (its fake store closes): the next test starts at zero."""
+    yield
+    for _ in range(200):
+        if s3_module._ABANDONED.open == 0:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{s3_module._ABANDONED.open} abandoned calls still open")
+
+
+def test_abandoned_calls_are_bounded_and_a_new_one_fails_at_once(records):
+    """A store that stopped answering must not pile threads, sockets and objects: past four
+    abandoned calls a new one fails straight away, and once they end, calls run again.
+    """
+    release = threading.Event()
+    for _ in range(s3_module._ABANDONED_LIMIT):
+        with pytest.raises(FileStoreError, match="^file store: put: past the 0.05 s"):
+            s3_module._within(0.05, "put", release.wait)
+    assert s3_module._ABANDONED.open == s3_module._ABANDONED_LIMIT
+    started = time.monotonic()
+    with pytest.raises(
+        FileStoreError,
+        match="^file store: get: 4 earlier calls are still open past their deadline$",
+    ):
+        s3_module._within(30, "get", lambda: b"never called")
+    assert time.monotonic() - started < 1
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert warnings[-1] == "file store: put abandoned past its 0.05 s deadline (4 open)"
+    release.set()
+    for _ in range(100):
+        if s3_module._ABANDONED.open == 0:
+            break
+        time.sleep(0.02)
+    assert s3_module._within(5, "get", lambda: b"ok") == b"ok"
+
+
+def test_a_call_that_ends_as_its_deadline_passes_is_not_counted_abandoned(monkeypatch):
+    class LateEvent(threading.Event):
+        def wait(self, timeout=None):
+            super().wait(5)  # the call ends...
+            return False  # ...but the wait reports the deadline passed
+
+    monkeypatch.setattr(s3_module.threading, "Event", LateEvent)
+    assert s3_module._within(0.01, "get", lambda: b"ok") == b"ok"
+    assert s3_module._ABANDONED.open == 0
+
+
+def test_an_upload_past_its_deadline_stops_itself():
+    """botocore reads the body a chunk at a time: once the deadline has passed, the next read
+    raises, so an abandoned upload stops instead of trickling on to a slow store."""
+    ticks = iter([0.0, 1.0, 3.0])
+    upload = s3_module._Upload(b"abcdef", 2.0, 2, clock=lambda: next(ticks))
+    assert upload.read(3) == b"abc"
+    assert upload.read(3) == b"def"
+    with pytest.raises(
+        FileStoreError, match="^file store: put: past the 2 s deadline$"
+    ):
+        upload.read(3)
+
+
+def test_a_409_is_tried_once_more_and_a_412_then_means_stored(
+    fake_s3, s3_settings, monkeypatch
+):
+    """Two jobs racing on one key: S3 may answer the second 409 (a conditional write in progress).
+    One more try settles it: 412 when the other one landed, 200 when it did not."""
+    monkeypatch.setattr(s3_module, "_CONFLICT_PAUSE_S", 0)
+    landed = fake_s3(puts=(409, 412), code="ConditionalRequestConflict")
+    assert not _put(_store_at(s3_settings, landed.url))
+    assert landed.methods() == ["PUT", "PUT"]
+    failed = fake_s3(puts=(409, 200), code="ConditionalRequestConflict")
+    assert _put(_store_at(s3_settings, failed.url))
+    assert failed.methods() == ["PUT", "PUT"]
+    stuck = fake_s3(puts=(409, 409), code="ConditionalRequestConflict")
+    with pytest.raises(
+        FileStoreError, match="^file store: put: HTTP 409 ConditionalRequestConflict$"
+    ):
+        _put(_store_at(s3_settings, stuck.url))
+    assert stuck.methods() == ["PUT", "PUT"]
+
+
+def test_get_refuses_an_object_over_max_bytes_before_reading_it(store, monkeypatch):
+    _put(store)
+    read = s3_module._read_within
+    reads = []
+    monkeypatch.setattr(
+        s3_module, "_read_within", lambda *a, **k: reads.append(1) or read(*a, **k)
+    )
+    assert store.get(_key(), max_bytes=len(PDF)) == PDF
+    with pytest.raises(
+        FileStoreError, match=f"^file store: get: over the {len(PDF) - 1} bytes asked$"
+    ):
+        store.get(_key(), max_bytes=len(PDF) - 1)
+    assert reads == [1]  # the object that fitted was read; the larger one never was
+
+
+def test_get_stops_reading_once_past_max_bytes():
+    """A store that gives no length, or the wrong one, is capped while reading."""
+    body = io.BytesIO(b"x" * (3 * s3_module._CHUNK))
+    with pytest.raises(
+        FileStoreError, match="^file store: get: over the 10 bytes asked$"
+    ):
+        s3_module._read_within(body, 1e9, 60, max_bytes=10)
+
+
+def test_metadata_without_a_length_is_a_file_store_error(s3_settings, monkeypatch):
+    class NoLength:
+        def head_object(self, **_):
+            return {"ContentType": "application/pdf", "Metadata": {}}
+
+    monkeypatch.setattr(s3_module, "s3_client", lambda settings: NoLength())
+    with pytest.raises(
+        FileStoreError, match="^file store: metadata: the store gave no length$"
+    ):
+        S3FileStore(s3_settings).metadata(_key())

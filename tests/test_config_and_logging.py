@@ -2,6 +2,7 @@
 
 import dataclasses
 import logging
+import os
 import re
 from pathlib import Path
 from uuid import UUID
@@ -22,7 +23,7 @@ from src.logging import LIBRARY_LEVELS, LOG_FORMAT, LOGGER_NAME, build_logger, l
 TENANT = "0192a3b4-0000-7000-8000-000000000001"
 TOKEN = "config-test-token-0123456789abcdef0123456789abcdef"
 EVERY_VARIABLE = {
-    "NICKEL_ENV": "qa",
+    "NICKEL_ENV": "development",
     "NICKEL_LOG_LEVEL": "debug",
     "NICKEL_CORS_ORIGINS": "http://a.example, http://b.example ,",
     "NICKEL_SERVICE_TOKEN": TOKEN,
@@ -48,11 +49,12 @@ SECRET_FILES = {
     "NICKEL_S3_ACCESS_KEY_ID_FILE",
     "NICKEL_S3_SECRET_ACCESS_KEY_FILE",
 }
-# What production, the default, needs besides: the S3 File Store (http on loopback only).
+# What production, the default, needs besides: the S3 File Store (http on loopback only), its
+# credentials in mounted files (conftest's), never the variables themselves.
 PRODUCTION_S3 = {
     "NICKEL_S3_ENDPOINT_URL": "http://127.0.0.1:8333",
-    "NICKEL_S3_ACCESS_KEY_ID": "config-test-access-key",
-    "NICKEL_S3_SECRET_ACCESS_KEY": "config-test-secret-0123456789abcdef",
+    "NICKEL_S3_ACCESS_KEY_ID_FILE": os.environ["NICKEL_S3_ACCESS_KEY_ID_FILE"],
+    "NICKEL_S3_SECRET_ACCESS_KEY_FILE": os.environ["NICKEL_S3_SECRET_ACCESS_KEY_FILE"],
 }
 # The settings tests below that are not about the environment run as development.
 DEVELOPMENT = {"NICKEL_ENV": "development"}
@@ -77,8 +79,8 @@ def test_the_shipped_configuration_falls_back_to_the_defaults():
         endpoint_url="http://127.0.0.1:8333",
         region="us-east-1",
         originals_bucket="originals",
-        access_key_id="config-test-access-key",
-        secret_access_key="config-test-secret-0123456789abcdef",
+        access_key_id="test-access-key",
+        secret_access_key="test-secret-0123456789abcdef",
         ca_bundle=None,
         allow_public_endpoint=False,
         require_https=True,
@@ -88,7 +90,7 @@ def test_the_shipped_configuration_falls_back_to_the_defaults():
 
 def test_the_shipped_configuration_reads_every_variable():
     settings = load_settings(CONF_FILE, environ=EVERY_VARIABLE)
-    assert settings.environment == "qa"
+    assert settings.environment == "development"
     assert settings.log_level == "DEBUG"
     assert settings.cors_origins == ("http://a.example", "http://b.example")
     assert settings.service_token == TOKEN
@@ -106,7 +108,7 @@ def test_the_shipped_configuration_reads_every_variable():
         secret_access_key="config-test-secret-0123456789abcdef",
         ca_bundle=CONF_FILE,
         allow_public_endpoint=False,
-        require_https=False,  # qa: plain http to a private host is taken
+        require_https=False,  # development: plain http to a private host is taken
         call_deadline_s=120,
     )
 

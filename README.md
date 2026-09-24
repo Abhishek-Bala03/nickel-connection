@@ -79,8 +79,9 @@ Settings come from `app/conf/application.conf`, whose `${VAR}` values come from 
 - `NICKEL_FILE_STORE`: where the originals go, `s3` or `local` (under `NICKEL_DATA_DIR`). Production
   defaults to `s3` and refuses `local`; development and qa default to `local`. With `s3`:
   `NICKEL_S3_ENDPOINT_URL` (loopback, private or the tailnet, whatever the host's name; https off
-  loopback in production), `NICKEL_S3_REGION`, `NICKEL_S3_ORIGINALS_BUCKET`, `NICKEL_S3_ACCESS_KEY_ID`
-  and `NICKEL_S3_SECRET_ACCESS_KEY` (or their `_FILE` variants), `NICKEL_S3_CA_BUNDLE`,
+  loopback outside development), `NICKEL_S3_REGION`, `NICKEL_S3_ORIGINALS_BUCKET`,
+  `NICKEL_S3_ACCESS_KEY_ID` and `NICKEL_S3_SECRET_ACCESS_KEY` (their `_FILE` variants only, outside
+  development), `NICKEL_S3_CA_BUNDLE`,
   `NICKEL_S3_ALLOW_PUBLIC_ENDPOINT` and `NICKEL_S3_CALL_DEADLINE_SECONDS`, all checked at start-up
   ([docs/document-ingestion.md](docs/document-ingestion.md), "File Store"). SeaweedFS runs it in
   compose's `s3` profile ([docs/docker.md](docs/docker.md)).

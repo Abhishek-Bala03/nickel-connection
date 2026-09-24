@@ -1,4 +1,8 @@
+import atexit
 import os
+import shutil
+import tempfile
+from pathlib import Path
 
 # The service does not start without its token (src.services.auth), and importing main starts it. Set
 # before the imports below, and forced rather than defaulted: the tests never depend on the shell.
@@ -6,14 +10,21 @@ SERVICE_TOKEN = "test-service-token-0123456789abcdef0123456789abcdef"
 os.environ["NICKEL_SERVICE_TOKEN"] = SERVICE_TOKEN
 os.environ.pop("NICKEL_SERVICE_TOKEN_FILE", None)
 # Nor, in production (the default, forced here too), without the S3 File Store: a loopback endpoint,
-# which nothing contacts (the fixtures below run on local stores; the S3 tests set their own).
+# which nothing contacts (the fixtures below run on local stores; the S3 tests set their own), and
+# credentials in files, as production takes them (never the variables themselves).
 for _name in [name for name in os.environ if name.startswith("NICKEL_S3_")]:
     del os.environ[_name]
 for _name in ("NICKEL_ENV", "NICKEL_FILE_STORE"):
     os.environ.pop(_name, None)
+S3_ACCESS_KEY_ID = "test-access-key"
+S3_SECRET_ACCESS_KEY = "test-secret-0123456789abcdef"
+_SECRETS = Path(tempfile.mkdtemp(prefix="nickel-s3-test-"))
+atexit.register(shutil.rmtree, _SECRETS, ignore_errors=True)
+(_SECRETS / "s3-access-key-id").write_text(S3_ACCESS_KEY_ID, encoding="utf-8")
+(_SECRETS / "s3-secret-access-key").write_text(S3_SECRET_ACCESS_KEY, encoding="utf-8")
 os.environ["NICKEL_S3_ENDPOINT_URL"] = "http://127.0.0.1:8333"
-os.environ["NICKEL_S3_ACCESS_KEY_ID"] = "test-access-key"
-os.environ["NICKEL_S3_SECRET_ACCESS_KEY"] = "test-secret-0123456789abcdef"
+os.environ["NICKEL_S3_ACCESS_KEY_ID_FILE"] = str(_SECRETS / "s3-access-key-id")
+os.environ["NICKEL_S3_SECRET_ACCESS_KEY_FILE"] = str(_SECRETS / "s3-secret-access-key")
 
 import dataclasses
 import logging

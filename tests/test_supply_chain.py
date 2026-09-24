@@ -101,8 +101,20 @@ def test_the_development_object_store_is_pinned_off_by_default_and_commits_no_se
     # The IAM gRPC that listens with the S3 API takes a token signed with a key made at start.
     assert "export WEED_JWT_FILER_SIGNING_KEY" in services["seaweedfs"]["entrypoint"][2]
     assert services["seaweedfs-init"]["network_mode"] == "service:seaweedfs"
-    # The identities are written from .env: the committed file names the variable, not a value.
-    identities = compose["configs"]["seaweedfs-identities"]["content"]
-    assert '"secretKey": "${NICKEL_S3_SECRET_ACCESS_KEY:-}"' in identities
+    # The identities are written at start from compose's secret (the committed file names the
+    # variable, never a value, and `docker compose config` prints no config that holds it), into
+    # a tmpfs; SeaweedFS keeps no capabilities and cannot gain privileges.
+    assert "configs" not in compose
+    assert compose["secrets"] == {
+        "s3-secret-access-key": {"environment": "NICKEL_S3_SECRET_ACCESS_KEY"}
+    }
+    seaweedfs = services["seaweedfs"]
+    assert seaweedfs["secrets"] == ["s3-secret-access-key"]
+    assert "cat /run/secrets/s3-secret-access-key" in seaweedfs["entrypoint"][2]
+    assert "/etc/seaweedfs" in seaweedfs["tmpfs"]
+    assert seaweedfs["cap_drop"] == ["ALL"]
+    # only what the image needs to drop to its own user
+    assert seaweedfs["cap_add"] == ["CHOWN", "SETUID", "SETGID"]
+    assert seaweedfs["security_opt"] == ["no-new-privileges:true"]
     environment = services["nickel-connection"]["environment"]
     assert environment["NICKEL_FILE_STORE"] == "${NICKEL_FILE_STORE:-local}"

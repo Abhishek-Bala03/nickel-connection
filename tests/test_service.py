@@ -331,8 +331,10 @@ def test_api_docs_are_off_unless_the_environment_is_set_explicitly():
         CONF_FILE,
         environ={
             "NICKEL_S3_ENDPOINT_URL": "http://127.0.0.1:8333",
-            "NICKEL_S3_ACCESS_KEY_ID": "k",
-            "NICKEL_S3_SECRET_ACCESS_KEY": "s",
+            "NICKEL_S3_ACCESS_KEY_ID_FILE": os.environ["NICKEL_S3_ACCESS_KEY_ID_FILE"],
+            "NICKEL_S3_SECRET_ACCESS_KEY_FILE": os.environ[
+                "NICKEL_S3_SECRET_ACCESS_KEY_FILE"
+            ],
         },
     )
     client = TestClient(_service(environment=unset.environment), headers=AUTH)

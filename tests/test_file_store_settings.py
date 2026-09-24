@@ -4,6 +4,7 @@ by what the S3 client takes."""
 
 import dataclasses
 import logging
+import os
 from uuid import UUID
 
 import pytest
@@ -20,7 +21,9 @@ TENANT = "0192a3b4-0000-7000-8000-000000000001"
 
 def _s3(**variables):
     """Settings for the S3 backend in development: a loopback endpoint and both credentials, then
-    ``variables`` (an empty value unsets one)."""
+    ``variables`` (an empty value unsets one). Outside development the credentials come from
+    files, as production takes them (conftest's mounted secrets), unless a test names them.
+    """
     environ = {
         "NICKEL_ENV": "development",
         "NICKEL_FILE_STORE": "s3",
@@ -29,6 +32,11 @@ def _s3(**variables):
         "NICKEL_S3_SECRET_ACCESS_KEY": SECRET,
     }
     environ.update(variables)
+    if (environ.get("NICKEL_ENV") or "production").lower() != "development":
+        for name in ("NICKEL_S3_ACCESS_KEY_ID", "NICKEL_S3_SECRET_ACCESS_KEY"):
+            if name not in variables and f"{name}_FILE" not in variables:
+                environ[name] = ""
+                environ[f"{name}_FILE"] = os.environ[f"{name}_FILE"]
     return load_settings(CONF_FILE, environ={k: v for k, v in environ.items() if v})
 
 
@@ -253,15 +261,19 @@ def test_production_takes_https_or_loopback(monkeypatch, url):
         "http://rustfs.nickel.svc.cluster.local:9000",
     ],
 )
-def test_production_refuses_plain_http_off_loopback(monkeypatch, url):
-    """The originals, and the credentials' signatures, would cross the network in clear. There is
-    no override for it: a private CA comes in through NICKEL_S3_CA_BUNDLE."""
+def test_only_development_takes_plain_http_off_loopback(monkeypatch, url):
+    """The originals, and the credentials' signatures, would cross the network in clear, and a
+    checked name that resolves elsewhere later would get them: TLS (the name's certificate) is
+    what stops that. There is no override for it: a private CA comes in through
+    NICKEL_S3_CA_BUNDLE."""
     monkeypatch.setattr(endpoints, "resolve", lambda host: ["10.43.0.12"])
-    with pytest.raises(ValueError, match="plain http to a host that is not loopback"):
-        _s3(NICKEL_ENV="production", NICKEL_S3_ENDPOINT_URL=url)
-    # The same endpoint is taken in development and qa.
-    for environment in ("development", "qa"):
-        assert _s3(NICKEL_ENV=environment, NICKEL_S3_ENDPOINT_URL=url).s3
+    for environment in ("production", "qa"):
+        with pytest.raises(
+            ValueError, match="plain http to a host that is not loopback"
+        ):
+            _s3(NICKEL_ENV=environment, NICKEL_S3_ENDPOINT_URL=url)
+    # A development stack alone takes it (compose's http://seaweedfs:8333).
+    assert _s3(NICKEL_ENV="development", NICKEL_S3_ENDPOINT_URL=url).s3
 
 
 def test_a_name_that_resolves_to_loopback_and_further_is_not_loopback(monkeypatch):
@@ -441,3 +453,21 @@ def test_the_settings_never_show_the_s3_credentials():
     for text in (repr(settings), str(settings), repr(settings.s3), str(settings.s3)):
         assert ACCESS_KEY not in text
         assert SECRET not in text
+
+
+@pytest.mark.parametrize("environment", ["qa", "production"])
+@pytest.mark.parametrize(
+    "name", ["NICKEL_S3_ACCESS_KEY_ID", "NICKEL_S3_SECRET_ACCESS_KEY"]
+)
+def test_outside_development_the_s3_credentials_come_from_files(environment, name):
+    """Env credentials are for a development stack only: a deployment mounts them (Vault, a CSI
+    secret) and names the file. The error names the variable, never the value."""
+    with pytest.raises(ValueError) as caught:
+        _s3(
+            NICKEL_ENV=environment, **{name: "from-the-environment", f"{name}_FILE": ""}
+        )
+    assert str(caught.value).startswith(f"{name} is for development: in {environment}")
+    assert "from-the-environment" not in str(caught.value)
+    # the same from a file is taken, and in development the variable itself is too
+    assert _s3(NICKEL_ENV=environment).s3.access_key_id
+    assert _s3(**{name: "from-the-environment"}).s3
