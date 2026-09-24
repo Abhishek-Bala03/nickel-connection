@@ -1,5 +1,6 @@
 import dataclasses
 import errno
+import hashlib
 import json
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from src.config import APP_DIR
 from src.db import outbox as outbox_module
 from src.db import receipts as receipts_module
 from src.db.file_store import LocalFileStore, local
+from src.db.file_store.base import FileStoreError, MissingObjectError
 from src.db.jobs import Job, JobStatus, JobStore
 from src.db.layout import DataLayout
 from src.db.outbox import JsonlOutbox, PublishError
@@ -44,20 +46,60 @@ def test_the_data_layout_is_one_root(tmp_path):
 
 
 # ── File Store ───────────────────────────────────────────────────────────────
+def _key(data: bytes) -> str:
+    """A content-addressed key for ``data``, as object_key builds them."""
+    sha = hashlib.sha256(data).hexdigest()
+    return f"t/documents/{sha[:2]}/{sha}"
+
+
 def test_put_is_write_once_and_keeps_metadata(tmp_path):
     store = LocalFileStore(tmp_path)
-    key = "t/documents/ab/abc"
+    key = _key(b"one")
     assert store.put(
-        key, b"one", content_type="application/pdf", metadata={"source": "s"}
+        key, b"one", content_type="application/pdf", metadata={"sha256": "s"}
     )
-    assert not store.put(key, b"two", content_type="application/pdf", metadata={})
+    assert not store.put(
+        key, b"one", content_type="application/pdf", metadata={"sha256": "other"}
+    )
     assert store.get(key) == b"one"
     assert store.metadata(key) == {
         "bytes": 3,
         "content_type": "application/pdf",
-        "source": "s",
+        "sha256": "s",
     }
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+def test_the_local_store_applies_the_s3_stores_contract(tmp_path):
+    """Development and qa default to this store: what production's S3 store refuses is refused
+    here too, and it reads and reports the same way."""
+    store = LocalFileStore(tmp_path)
+    key = _key(b"one")
+    with pytest.raises(ValueError, match="not the ones their key names"):
+        store.put(key, b"two", content_type="application/pdf", metadata={})
+    with pytest.raises(ValueError, match="metadata name 'Source'"):
+        store.put(key, b"one", content_type="application/pdf", metadata={"Source": "s"})
+    with pytest.raises(FileStoreError, match="over the 2048 S3 takes"):
+        store.put(
+            key, b"one", content_type="application/pdf", metadata={"x": "é" * 800}
+        )
+    assert not list(tmp_path.rglob("*"))  # nothing written by a refused put
+    # A missing object names no path.
+    for read in (store.get, store.metadata):
+        with pytest.raises(MissingObjectError) as caught:
+            read(key)
+        assert str(tmp_path) not in str(caught.value)
+        assert caught.value.__cause__ is None
+    store.put(key, b"one", content_type="application/pdf", metadata={})
+    with pytest.raises(
+        FileStoreError, match="^file store: get: over the 2 bytes asked$"
+    ):
+        store.get(key, max_bytes=2)
+    assert store.get(key, max_bytes=3) == b"one"
+    # Bytes replaced behind the store are refused, not returned.
+    (tmp_path / key).write_bytes(b"new")
+    with pytest.raises(FileStoreError, match="not the ones their key names"):
+        store.get(key)
 
 
 @pytest.mark.parametrize("key", ["", "/abs", "a/../b", "a//b", "a\\b", "./a"])
@@ -89,7 +131,7 @@ def test_a_crash_at_the_first_rename_cannot_strand_an_object(tmp_path, monkeypat
 
     monkeypatch.setattr(local.os, "replace", crash_after_the_first_rename)
     store = LocalFileStore(tmp_path)
-    key = "t/documents/ab/abc"
+    key = _key(b"one")
     with pytest.raises(OSError, match="power cut"):
         store.put(key, b"one", content_type="application/pdf", metadata={})
     # Whatever landed first must not be the object without its metadata: the next put writes the
@@ -143,7 +185,7 @@ def test_put_fsyncs_each_file_before_its_rename(tmp_path, monkeypatch):
     events = []
     _durability_spies(monkeypatch, events, directories=False)  # as on Windows
     LocalFileStore(tmp_path).put(
-        "t/documents/ab/abc", b"one", content_type="application/pdf", metadata={}
+        _key(b"one"), b"one", content_type="application/pdf", metadata={}
     )
     # sidecar first (fsync, rename), object second (fsync, rename); no directory is opened
     assert events == ["fsync", ("rename", "json"), "fsync", ("rename", "object")]
@@ -159,9 +201,9 @@ def test_on_posix_each_rename_and_each_new_directory_is_made_durable(
     _durability_spies(monkeypatch, events, directories=True)  # as on Linux
     root = tmp_path / "fs"  # the root itself does not exist yet
     LocalFileStore(root).put(
-        "t/documents/ab/abc", b"one", content_type="application/pdf", metadata={}
+        _key(b"one"), b"one", content_type="application/pdf", metadata={}
     )
-    leaf = root / "t" / "documents" / "ab"
+    leaf = root.joinpath(*_key(b"one").split("/")[:3])  # t/documents/<sha[:2]>
     assert events == [
         ("dir", tmp_path),  # fs was created in tmp_path
         "dir-fsync",
@@ -169,7 +211,7 @@ def test_on_posix_each_rename_and_each_new_directory_is_made_durable(
         "dir-fsync",
         ("dir", root / "t"),  # documents in t
         "dir-fsync",
-        ("dir", root / "t" / "documents"),  # ab in documents
+        ("dir", root / "t" / "documents"),  # <sha[:2]> in documents
         "dir-fsync",
         "fsync",
         ("rename", "json"),
@@ -181,9 +223,12 @@ def test_on_posix_each_rename_and_each_new_directory_is_made_durable(
         "dir-fsync",
     ]
     # A second object in the same directory creates nothing: only the two renames are made durable.
+    # (Its bytes are picked so their sha256 starts as b"one"'s does: the same <sha[:2]> folder.)
+    second = b"same-folder-447"
+    assert _key(second).split("/")[:3] == _key(b"one").split("/")[:3]
     del events[:]
     LocalFileStore(root).put(
-        "t/documents/ab/abd", b"two", content_type="application/pdf", metadata={}
+        _key(second), second, content_type="application/pdf", metadata={}
     )
     assert [e for e in events if isinstance(e, tuple) and e[0] == "dir"] == [
         ("dir", leaf),

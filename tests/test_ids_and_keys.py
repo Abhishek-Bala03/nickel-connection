@@ -53,7 +53,8 @@ def test_parse_tenant_id_keeps_a_uuid_instance():
     assert parse_tenant_id(value) is value
 
 
-@pytest.mark.parametrize("bad", ["AB" * 32, "ab" * 31, "zz" * 32])
+# A trailing newline too: re.match with "$" would let one through (fullmatch does not).
+@pytest.mark.parametrize("bad", ["AB" * 32, "ab" * 31, "zz" * 32, "ab" * 32 + chr(10)])
 def test_sha256_must_be_64_lowercase_hex(bad):
     with pytest.raises(ValueError, match="sha256"):
         object_key(TENANT, ObjectClass.DOCUMENTS, bad)

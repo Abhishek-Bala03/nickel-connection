@@ -96,7 +96,6 @@ class SourceContext:
     trace_id: str  # the run's id: every envelope the run publishes carries it
     connection_id: str | None = None
     shadow: bool = False  # store and receipt, publish nothing (the manifest's shadow)
-    raw_retention: str = "forever"  # the manifest's raw_retention, kept on the object
 
 
 @dataclass(frozen=True)
@@ -297,12 +296,10 @@ class IngestBridge:
             key,
             item.data,
             content_type=content_type,
-            metadata={
-                "sha256": sha,
-                "source": ctx.source,
-                "message_id": item.message_id,
-                "raw_retention": ctx.raw_retention,
-            },
+            # Content facts only: the object is shared by every receipt that names these bytes, so
+            # who sent it, under which message id and for how long it is kept stay on the receipts
+            # (expiry keeps it for the longest raw_retention among them: issue #6).
+            metadata={"sha256": sha},
         )
         status, detail = (
             (ReceiptStatus.HELD, "held for shadow mode")

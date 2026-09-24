@@ -26,9 +26,9 @@ app/
     services/              API routes, one router per module, collected in base_router; the service token
     handler/               business logic the routes call: ingest bridge, documents, jobs
     models/                request and response models, the raw_data envelope
-    db/                    File Store, the raw_data outbox, receipts, job records
+    db/                    File Store (local disk or S3), the raw_data outbox, receipts, job records
     connectors/            source connectors (documents; Nango sources planned)
-    utility/               small shared helpers (UUIDv7 ids, object keys)
+    utility/               small shared helpers (UUIDv7 ids, object keys, the internal-endpoint rule)
 tests/                     unit tests (pytest), outside the image
 docs/                      design notes and how-tos, outside the image
 Dockerfile, compose.yaml   image and local run
@@ -43,8 +43,8 @@ the errors in `src/error` (they become JSON with the right status and the reques
 ## Docs
 
 - [Jobs API](docs/jobs-api.md): what the scheduler calls to queue a pull or a republish, read a job and list the receipts; the service token, `Idempotency-Key`, the 429 and `Retry-After`.
-- [Document ingestion](docs/document-ingestion.md): the PDF connector, its manifests (a CN-01 subset: `fetch`, `auth`, `contract`, `phase`, `shadow`, `raw_retention`), the receipts, the egress rule, delivery, what is temporary, and where parsing and extraction went.
-- [Docker](docs/docker.md): run the service and the command line in Docker; `NICKEL_SERVICE_TOKEN`, `NICKEL_ENV`, `DEV_SOURCES`.
+- [Document ingestion](docs/document-ingestion.md): the PDF connector, its manifests (a CN-01 subset: `fetch`, `auth`, `contract`, `phase`, `shadow`, `raw_retention`), the receipts, the egress rule, delivery, the File Store (local or S3), what is temporary, and where parsing and extraction went.
+- [Docker](docs/docker.md): run the service and the command line in Docker; `NICKEL_SERVICE_TOKEN`, `NICKEL_ENV`, `DEV_SOURCES`; SeaweedFS for the S3 File Store.
 - [Decision records](docs/decisions/): [0001](docs/decisions/0001-idempotency-key.md), the idempotency key and D-00 (Proposed); [0002](docs/decisions/0002-too-large-receipts-for-pulls.md), a too_large receipt for an item a pull never fetched (Proposed).
 - [SonarQube](docs/sonarqube.md): the free SonarQube setup with Docker.
 
@@ -73,8 +73,18 @@ Settings come from `app/conf/application.conf`, whose `${VAR}` values come from 
   `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 - `NICKEL_ENV`: `development`, `qa` or `production`. `production` unless set. The API docs (`/docs`,
   `/redoc`, `/openapi.json`) take no token, so they are on in `development` only; set that on a laptop.
+  Production also needs the S3 File Store (below).
 - `NICKEL_TENANT_ID`: the tenant (a UUID) everything is ingested for. Without it the service starts,
   but pulls are refused.
+- `NICKEL_FILE_STORE`: where the originals go, `s3` or `local` (under `NICKEL_DATA_DIR`). Production
+  defaults to `s3` and refuses `local`; development and qa default to `local`. With `s3`:
+  `NICKEL_S3_ENDPOINT_URL` (loopback, private or the tailnet, whatever the host's name; https off
+  loopback outside development), `NICKEL_S3_REGION`, `NICKEL_S3_ORIGINALS_BUCKET`,
+  `NICKEL_S3_ACCESS_KEY_ID` and `NICKEL_S3_SECRET_ACCESS_KEY` (their `_FILE` variants only, outside
+  development), `NICKEL_S3_CA_BUNDLE`,
+  `NICKEL_S3_ALLOW_PUBLIC_ENDPOINT` and `NICKEL_S3_CALL_DEADLINE_SECONDS`, all checked at start-up
+  ([docs/document-ingestion.md](docs/document-ingestion.md), "File Store"). SeaweedFS runs it in
+  compose's `s3` profile ([docs/docker.md](docs/docker.md)).
 - `DEV_SOURCES=1`, a build argument of the `Dockerfile`: adds the Kaggle and Hugging Face SDKs for the
   development manifests. `compose.yaml` sets it; the production image is built without.
 

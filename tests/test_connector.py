@@ -421,15 +421,22 @@ def test_a_dev_manifest_is_refused_in_production(bridge, pdf_bytes):
 
 
 @pytest.mark.parametrize("retention", ["forever", "90d"])
-def test_retention_comes_from_the_manifest(bridge, pdf_bytes, retention):
-    """The object class stays documents whatever the retention; the value itself is recorded on
-    the stored object's sidecar, where the File Store lifecycle rule reads it."""
+def test_the_object_carries_content_facts_only_whatever_the_retention(
+    bridge, pdf_bytes, retention
+):
+    """The object class stays documents whatever the retention. The object is shared by every
+    receipt that names its bytes, so it carries facts about the content alone; the source and
+    its raw_retention stay with each receipt, where expiry reads them (issue #6)."""
     manifest = _manifest(raw_retention=retention)
     connector = _connector(manifest, bridge, FakeSource([_file("a.pdf", pdf_bytes)]))
     assert connector.context.retention_class is manifest.retention_class
-    assert connector.context.raw_retention == manifest.raw_retention == retention
     connector.run()
     [message] = bridge.publisher.read("raw_data")
     assert message["value"]["retention_class"] == "documents"
     [receipt] = bridge.receipts.recent(tenant_id=TENANT)
-    assert bridge.store.metadata(receipt.payload_ref)["raw_retention"] == retention
+    assert receipt.source == manifest.id
+    assert bridge.store.metadata(receipt.payload_ref) == {
+        "sha256": receipt.payload_sha256,
+        "content_type": "application/pdf",
+        "bytes": len(pdf_bytes),
+    }

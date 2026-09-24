@@ -6,8 +6,8 @@
     python -m src.cli schema envelope|manifest [--out FILE]           JSON Schema of a contract
 
 The same settings as the service (conf/application.conf and the environment). Exit codes: 0 done,
-1 the run had a problem (source unreachable, run aborted), 2 a setting is wrong (a manifest that
-does not load included).
+1 the run had a problem (source or File Store unreachable, run aborted), 2 a setting is wrong
+(a manifest that does not load included).
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from typing import TextIO
 from src.config import ServiceSettings, load_settings
 from src.connectors.documents import DocumentManifest, ManifestError
 from src.connectors.documents.sources import FetchError
+from src.db.file_store import FileStoreError
 from src.error import UnavailableError
 from src.handler import documents
 from src.logging import logger
@@ -58,7 +59,7 @@ def _pull(args: argparse.Namespace, settings: ServiceSettings, out: TextIO) -> i
         summary = documents.pull_documents(
             settings, manifest, limit=args.limit, trace_id=uuid7().hex
         )
-    except FetchError as exc:
+    except (FetchError, FileStoreError) as exc:
         return _fail(str(exc), 1)
     except OSError as exc:
         # The File Store could not write, say: the OS's text quotes a path, so the type only,

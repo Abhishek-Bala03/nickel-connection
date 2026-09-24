@@ -27,7 +27,12 @@ def _run(argv, env=None):
 
 
 def _env(tmp_path):
-    return {"NICKEL_TENANT_ID": TENANT, "NICKEL_DATA_DIR": str(tmp_path / "data")}
+    # Development: the local File Store (production takes the S3 one only).
+    return {
+        "NICKEL_ENV": "development",
+        "NICKEL_TENANT_ID": TENANT,
+        "NICKEL_DATA_DIR": str(tmp_path / "data"),
+    }
 
 
 def test_version_is_set():
@@ -137,7 +142,7 @@ def test_status_with_no_receipts(tmp_path):
 
 
 def test_a_missing_tenant_exits_2(capsys):
-    assert _run(["documents", "status"], env={})[0] == 2
+    assert _run(["documents", "status"], env={"NICKEL_ENV": "development"})[0] == 2
     assert "NICKEL_TENANT_ID" in capsys.readouterr().err
 
 

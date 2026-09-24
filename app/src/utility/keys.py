@@ -11,7 +11,7 @@ import re
 import uuid
 from enum import StrEnum
 
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class ObjectClass(StrEnum):
@@ -45,6 +45,6 @@ def object_key(
     """``<tenant>/<class>/<first two hex>/<sha256>``: tenant first, content-addressed, sharded for listing."""
     tenant = parse_tenant_id(tenant_id)
     klass = ObjectClass(object_class)
-    if not _SHA256.match(sha256):
+    if not _SHA256.fullmatch(sha256):
         raise ValueError("sha256 must be 64 lowercase hex characters")
     return f"{tenant}/{klass.value}/{sha256[:2]}/{sha256}"

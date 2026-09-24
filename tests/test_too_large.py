@@ -315,6 +315,7 @@ def test_the_api_and_the_command_line_show_no_hash_for_a_marker(
     assert shown == {"local-docs": None, "upload-docs": hashlib.sha256(big).hexdigest()}
     out = io.StringIO()
     env = {
+        "NICKEL_ENV": "development",  # the local File Store (production takes only S3)
         "NICKEL_TENANT_ID": str(settings.tenant_id),
         "NICKEL_DATA_DIR": str(settings.data_dir),
     }

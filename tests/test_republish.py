@@ -313,6 +313,7 @@ def test_republish_from_the_command_line(
 ):
     _pull(settings, pdf_folder, manifest_writer)
     env = {
+        "NICKEL_ENV": "development",
         "NICKEL_TENANT_ID": str(settings.tenant_id),
         "NICKEL_DATA_DIR": str(settings.data_dir),
         "NICKEL_MANIFEST_DIR": str(settings.manifest_dir),  # the source must be enabled

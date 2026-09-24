@@ -19,7 +19,10 @@ class NoSource:
 def test_manifests_are_shipped():
     assert MANIFESTS
     # Where the jobs API looks unless NICKEL_MANIFEST_DIR says otherwise.
-    assert load_settings(CONF_FILE, environ={}).manifest_dir == MANIFEST_DIR
+    assert (
+        load_settings(CONF_FILE, environ={"NICKEL_ENV": "development"}).manifest_dir
+        == MANIFEST_DIR
+    )
 
 
 @pytest.mark.parametrize("path", MANIFESTS, ids=lambda p: p.stem)
