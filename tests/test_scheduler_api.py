@@ -1,5 +1,6 @@
 """Tests for schedule configuration and manual execution through HTTP."""
 
+from datetime import UTC, datetime
 from threading import Event
 from uuid import UUID, uuid4
 
@@ -7,7 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nickel_connection.scheduler.api import build_app, create_app
+from nickel_connection.scheduler.models import Schedule
 from nickel_connection.scheduler.runner import ConnectorRunner, RunResult
+from nickel_connection.scheduler.store import ScheduleStore
 
 TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
 
@@ -149,3 +152,52 @@ def test_factory_reads_environment(tmp_path, monkeypatch):
 
     with TestClient(create_app()) as client:
         assert client.get("/health").status_code == 200
+
+
+@pytest.mark.parametrize("limit", ["0", "-1", "201", "abc", "1.5"])
+def test_invalid_run_history_limit_returns_422(client, limit):
+    response = client.get("/runs", params={"limit": limit})
+
+    assert response.status_code == 422
+
+
+def test_run_history_endpoint_applies_default_and_requested_limits(tmp_path):
+    database = tmp_path / "history.db"
+    now = datetime.now(UTC)
+    schedule = Schedule(
+        tenant_id=TENANT_ID,
+        name="History test",
+        connector_type="demo",
+        connection_id="history-connection",
+        interval_seconds=300,
+        enabled=False,
+        next_run_at=now,
+    )
+    store = ScheduleStore(database)
+    run_ids = []
+
+    try:
+        store.add(schedule)
+
+        for _ in range(55):
+            record = store.start_run(schedule, now)
+            assert record is not None
+            record.status = "succeeded"
+            record.finished_at = now
+            store.finish_run(record)
+            run_ids.append(str(record.id))
+    finally:
+        store.close()
+
+    with TestClient(build_app(database, TENANT_ID)) as client:
+        default_response = client.get("/runs")
+        assert default_response.status_code == 200
+        assert [run["id"] for run in default_response.json()] == list(
+            reversed(run_ids[-50:])
+        )
+
+        limited_response = client.get("/runs", params={"limit": 2})
+        assert limited_response.status_code == 200
+        assert [run["id"] for run in limited_response.json()] == list(
+            reversed(run_ids[-2:])
+        )

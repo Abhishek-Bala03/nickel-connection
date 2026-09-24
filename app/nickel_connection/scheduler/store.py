@@ -48,6 +48,12 @@ class ScheduleStore:
                 WHERE status = 'running'
                 """
             )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS scheduler_runs_tenant
+                ON scheduler_runs (tenant_id)
+                """
+            )
 
     def add(self, schedule: Schedule) -> None:
         with self._connection:
@@ -162,12 +168,34 @@ class ScheduleStore:
             if cursor.rowcount == 0:
                 raise KeyError("Running execution not found for this tenant")
 
-    def list_runs(self, tenant_id: UUID) -> list[RunRecord]:
+    def list_runs(
+        self,
+        tenant_id: UUID,
+        limit: int = 50,
+    ) -> list[RunRecord]:
+        """Return the latest runs for this tenant, newest first."""
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be an integer between 1 and 200")
+
         rows = self._connection.execute(
             """
             SELECT definition FROM scheduler_runs
             WHERE tenant_id = ?
             ORDER BY rowid DESC
+            LIMIT ?
+            """,
+            (str(tenant_id), limit),
+        ).fetchall()
+
+        return [RunRecord.model_validate_json(row[0]) for row in rows]
+
+    def list_running_runs(self, tenant_id: UUID) -> list[RunRecord]:
+        """Return all active runs for recovery, without a history limit."""
+        rows = self._connection.execute(
+            """
+            SELECT definition FROM scheduler_runs
+            WHERE tenant_id = ? AND status = 'running'
+            ORDER BY rowid
             """,
             (str(tenant_id),),
         ).fetchall()

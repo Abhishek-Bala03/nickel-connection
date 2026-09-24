@@ -38,20 +38,16 @@ def recover_interrupted_runs(
     tenant_id: UUID,
     now: datetime,
 ) -> int:
-    """Recover abandoned runs after exclusive ownership is obtained."""
-    recovered = 0
+    """Recover every abandoned run after exclusive ownership is obtained."""
+    records = store.list_running_runs(tenant_id)
 
-    for record in store.list_runs(tenant_id):
-        if record.status != "running":
-            continue
-
+    for record in records:
         record.status = "interrupted"
         record.finished_at = max(now, record.started_at)
         record.error_code = "scheduler_restarted"
         store.finish_run(record)
-        recovered += 1
 
-    return recovered
+    return len(records)
 
 
 def serve(

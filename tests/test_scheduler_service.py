@@ -259,3 +259,18 @@ def test_invalid_poll_interval_is_rejected(tmp_path, poll_seconds):
         )
 
     assert not database.exists()
+
+
+def test_recovery_is_not_limited_by_run_history(store):
+    for number in range(1, 61):
+        assert store.start_run(make_schedule(number), NOW) is not None
+
+    assert len(store.list_runs(TENANT_ID)) == 50
+    assert len(store.list_running_runs(TENANT_ID)) == 60
+
+    assert service.recover_interrupted_runs(store, TENANT_ID, NOW) == 60
+    assert store.list_running_runs(TENANT_ID) == []
+
+    records = store.list_runs(TENANT_ID, limit=200)
+    assert len(records) == 60
+    assert all(record.status == "interrupted" for record in records)

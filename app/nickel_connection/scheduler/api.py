@@ -5,9 +5,10 @@ import os
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 
 from .engine import RunUnavailableError, SchedulerEngine
 from .models import RunRecord, Schedule, ScheduleSettings
@@ -160,8 +161,10 @@ def build_app(
             raise HTTPException(status_code=409, detail=str(error)) from error
 
     @app.get("/runs", response_model=list[RunRecord])
-    async def list_runs():
-        return app.state.store.list_runs(tenant_id)
+    async def list_runs(
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ):
+        return app.state.store.list_runs(tenant_id, limit=limit)
 
     return app
 

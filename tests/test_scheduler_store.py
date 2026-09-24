@@ -226,3 +226,44 @@ def test_run_reservation_survives_reopening(tmp_path, schedule):
         assert second.start_run(schedule, schedule.next_run_at) is None
     finally:
         second.close()
+
+
+def test_run_history_is_limited_and_newest_first(store, schedule):
+    records = []
+
+    for _ in range(55):
+        record = store.start_run(schedule, schedule.next_run_at)
+        assert record is not None
+        record.status = "succeeded"
+        record.finished_at = record.started_at
+        store.finish_run(record)
+        records.append(record)
+
+    assert store.list_runs(schedule.tenant_id) == list(reversed(records[-50:]))
+    assert store.list_runs(schedule.tenant_id, limit=2) == list(reversed(records[-2:]))
+    assert store.list_runs(schedule.tenant_id, limit=200) == list(reversed(records))
+
+
+@pytest.mark.parametrize("limit", [0, -1, 201, True, 1.5, "50"])
+def test_invalid_history_limit_is_rejected(store, schedule, limit):
+    with pytest.raises(ValueError, match="limit must be"):
+        store.list_runs(schedule.tenant_id, limit=limit)
+
+
+def test_running_query_excludes_finished_runs_and_other_tenants(store, schedule):
+    finished = store.start_run(schedule, schedule.next_run_at)
+    assert finished is not None
+    finished.status = "succeeded"
+    finished.finished_at = finished.started_at
+    store.finish_run(finished)
+
+    active = store.start_run(schedule, schedule.next_run_at)
+    assert active is not None
+
+    other = schedule.model_copy(update={"tenant_id": uuid4()})
+    other_active = store.start_run(other, other.next_run_at)
+    assert other_active is not None
+
+    assert store.list_running_runs(schedule.tenant_id) == [active]
+    assert store.list_running_runs(other.tenant_id) == [other_active]
+    assert store.list_running_runs(uuid4()) == []
