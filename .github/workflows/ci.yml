@@ -34,7 +34,7 @@ jobs:
 
       - name: Trivy (HIGH and CRITICAL dependency vulnerabilities)
         run: |
-          curl -sSfL https://github.com/aquasecurity/trivy/releases/download/v0.56.2/trivy_0.56.2_Linux-64bit.tar.gz | tar -xz trivy
+          curl -sSfL https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz | tar -xz trivy
           ./trivy fs --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --scanners vuln --skip-dirs .venv .
 
       - name: SonarQube
