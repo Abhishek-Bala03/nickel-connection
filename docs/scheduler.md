@@ -1,8 +1,8 @@
 # Scheduler (NIK-2209-03)
 
 The scheduler owns timing and execution history. The connection service owns fetching,
-raw-file storage and publishing. This PR connects the scheduler to the existing
-**document jobs API**; Nango and other API adapters are the next integration step.
+raw-file storage and publishing. The scheduler drives two job kinds there: document pulls
+(`documents`) and Nango connector pulls (`nango`, docs/demo-nango-wearables.md).
 
 ## Small set of responsibilities
 
@@ -87,6 +87,14 @@ docker compose -f compose.yaml -f compose.scheduler.yaml up -d --build
 
 The UI binds loopback port 8080 by default. Put your TLS ingress in front of it or
 use an SSH tunnel for development. Do not weaken authentication for a demo.
+
+**Nango connections do not come from this file.** They are the enabled connectors an
+administrator added through the Connections UI, which is behind the same authenticated gateway;
+the scheduler reads them from the connection service's `GET /connectors` at start-up, before each
+create or update of a `nango` schedule, and when listing connections. If the connection service
+is down at start-up, `nango` schedules are kept and checked again when their run starts. A
+`nango` entry in the file is refused. Each run records the connection job it queued (`job_id`,
+schema v2), so the UI can show what the run stored.
 
 Approved connections are a JSON list of `id`, `name`, `connector_type` and (for
 `documents`) `manifest`. The manifest must exist and be cleared for this environment

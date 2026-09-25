@@ -109,6 +109,20 @@ def test_the_api_is_the_connection_layer_and_nothing_more(client):
         ("GET", "/jobs"),
         ("GET", "/jobs/{job_id}"),
         ("GET", "/documents"),
+        # Nango connectors (docs/demo-nango-wearables.md): references to Nango connections, their
+        # pull, and what a pull stored.
+        ("GET", "/connectors/catalog"),
+        ("GET", "/connectors"),
+        ("POST", "/connectors"),
+        ("GET", "/connectors/{connector_id}"),
+        ("PUT", "/connectors/{connector_id}"),
+        ("POST", "/connectors/{connector_id}/test"),
+        ("POST", "/jobs/nango/pull"),
+        ("GET", "/jobs/{job_id}/pulls"),
+        # The one exception to "serves no content": the administrator's Executions view shows a
+        # wearable pull's stored original exactly as the vendor sent it (never a document, never
+        # anything derived from one), by job and stream, capped at 5 MB.
+        ("GET", "/jobs/{job_id}/pulls/{stream}/payload"),
     }
 
 

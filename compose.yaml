@@ -25,6 +25,9 @@ services:
       # A local run: the API docs on unless .env or the shell says otherwise (the service itself
       # defaults to production, with the docs off).
       NICKEL_ENV: ${NICKEL_ENV:-development}
+      # The image's data volume, whatever .env says: .env.example's NICKEL_DATA_DIR=.data is for runs
+      # outside Docker, and env_file would otherwise carry it in onto the read-only root filesystem.
+      NICKEL_DATA_DIR: /data
       # The tenant everything is ingested for (a UUID): required, from .env or the shell.
       NICKEL_TENANT_ID: ${NICKEL_TENANT_ID:?set NICKEL_TENANT_ID (a UUID) in .env}
       # The service token callers must present: required, from .env or the shell (.env.example says how

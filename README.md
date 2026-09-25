@@ -46,6 +46,7 @@ the errors in `src/error` (they become JSON with the right status and the reques
 - [Document ingestion](docs/document-ingestion.md): the PDF connector, its manifests (a CN-01 subset: `fetch`, `auth`, `contract`, `phase`, `shadow`, `raw_retention`), the receipts, the egress rule, delivery, the File Store (local or S3), what is temporary, and where parsing and extraction went.
 - [Docker](docs/docker.md): run the service and the command line in Docker; `NICKEL_SERVICE_TOKEN`, `NICKEL_ENV`, `DEV_SOURCES`; SeaweedFS for the S3 File Store.
 - [Decision records](docs/decisions/): [0001](docs/decisions/0001-idempotency-key.md), the idempotency key and D-00 (Proposed); [0002](docs/decisions/0002-too-large-receipts-for-pulls.md), a too_large receipt for an item a pull never fetched (Proposed).
+- [Demo: wearables through Nango](docs/demo-nango-wearables.md): Nango and Postgres in Docker, simulated Oura and Dexcom, connectors, schedules and the pulled JSON in the Connections UI.
 - [SonarQube](docs/sonarqube.md): the free SonarQube setup with Docker.
 
 ## Branches and pull requests

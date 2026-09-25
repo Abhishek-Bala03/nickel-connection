@@ -587,7 +587,7 @@ def test_legacy_migration_preserves_tenants_history_order_and_reservations(
     with closing(sqlite3.connect(path)) as connection:
         assert connection.execute(
             "SELECT version FROM scheduler_schema"
-        ).fetchone() == (1,)
+        ).fetchone() == (2,)
         tables = {
             row[0]
             for row in connection.execute(

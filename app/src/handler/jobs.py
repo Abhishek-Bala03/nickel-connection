@@ -5,8 +5,9 @@ The queue is bounded (``[JOBS] max_queued``: a 429 beyond it) and a submission c
 ``Idempotency-Key``, so a scheduler that retries after a timeout gets the job it queued before
 instead of a second one.
 
-Two kinds of job: ``documents.pull`` brings a source in, ``documents.republish`` publishes the open
-receipts again from the envelopes they store. The scheduler queues a republish on a fixed cadence,
+Three kinds of job: ``documents.pull`` brings a source in, ``documents.republish`` publishes the open
+receipts again from the envelopes they store, and ``nango.pull`` brings a Nango connector's streams in
+(``src.handler.nango``). The scheduler queues a republish on a fixed cadence,
 and the worker queues one itself when it starts (``build_runner``). The connection layer ends at ``raw_data``, and what
 happens to a document after that (parsing, OCR, extraction) is the Document worker's, a service of
 its own. A job's id (a UUIDv7) is the ``trace_id`` of its run: every envelope the run publishes
@@ -34,7 +35,7 @@ from src.db.jobs import INTERRUPTED, Job, JobStatus, JobStore
 from src.db.layout import DataLayout
 from src.db.outbox import PublishError
 from src.error import ConflictError, NickelConnectionError, TooManyRequestsError
-from src.handler import documents
+from src.handler import documents, nango
 from src.logging import logger
 from src.utility.ids import uuid7
 
@@ -309,6 +310,7 @@ def build_runner(
     handlers: dict[str, JobHandler] = {
         PULL_KIND: lambda job: run_pull(settings, job),
         REPUBLISH_KIND: lambda job: run_republish(settings, job),
+        nango.PULL_KIND: lambda job: JobResult(nango.run_pull(settings, job)),
     }
     startup = []
     if republish_at_start and settings.tenant_id is not None:

@@ -194,6 +194,7 @@ class SchedulerEngine:
             async with asyncio.timeout_at(deadline):
                 result = await self._runner.run(schedule, record.id)
             record.items_processed = result.items_processed
+            record.job_id = result.job_id
             record.status = "succeeded"
         except asyncio.CancelledError:
             record.status = "interrupted"
@@ -205,6 +206,7 @@ class SchedulerEngine:
         except Exception as error:
             record.status = "failed"
             record.error_code = "connector_failed"
+            record.job_id = getattr(error, "job_id", None)
             logger.error("scheduler_run_failed error_type=%s", type(error).__name__)
         finally:
             record.finished_at = max(self._clock(), record.started_at)

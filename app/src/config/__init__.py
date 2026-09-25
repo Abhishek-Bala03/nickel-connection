@@ -109,6 +109,36 @@ class ServiceSettings:
     # [FILE_STORE]: where the originals go. None: the local File Store under data_dir (the default,
     # NICKEL_FILE_STORE=local); the S3 API's settings for NICKEL_FILE_STORE=s3.
     s3: S3Settings | None
+    # [NANGO]: Nango's API (auth + proxy only, decision 2) and its environment secret key, out of
+    # the repr like the token. None: Nango connectors are off.
+    nango_url: str | None = None
+    nango_secret_key: str = field(default="", repr=False)
+    # Development only: provider -> the base URL Nango's proxy is sent to instead of the vendor's
+    # (Base-Url-Override), e.g. the vendor simulator. Never taken from a connector row: a free-text
+    # base URL would be an SSRF path through Nango.
+    nango_base_url_overrides: Mapping[str, str] = field(default_factory=dict)
+
+
+def _nango_overrides(raw: str, environment: str) -> dict[str, str]:
+    """``oura=http://vendor-sim:8080/oura,dexcom=...``; refused outside development."""
+    if not raw:
+        return {}
+    if environment != "development":
+        raise ValueError(
+            "NICKEL_NANGO_BASE_URL_OVERRIDES is for development: qa and production call the "
+            "vendors' own APIs"
+        )
+    overrides = {}
+    for pair in raw.split(","):
+        provider, _, url = pair.strip().partition("=")
+        if not re.fullmatch(r"[a-z0-9-]{2,40}", provider) or not re.fullmatch(
+            r"https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._/-]*)?", url
+        ):
+            raise ValueError(
+                f"NICKEL_NANGO_BASE_URL_OVERRIDES entry {pair.strip()!r} is not provider=http(s)://host[:port][/path]"
+            )
+        overrides[provider] = url.rstrip("/")
+    return overrides
 
 
 def _tenant(raw: str) -> UUID | None:
@@ -313,4 +343,13 @@ def load_settings(
             "jobs max_queued", get("JOBS", "max_queued"), 100
         ),
         s3=_s3_settings(get, environment) if file_store == "s3" else None,
+        nango_url=get("NANGO", "url").rstrip("/") or None,
+        nango_secret_key=_secret(
+            "NICKEL_NANGO_SECRET_KEY",
+            get("NANGO", "secret_key"),
+            get("NANGO", "secret_key_file"),
+        ),
+        nango_base_url_overrides=_nango_overrides(
+            get("NANGO", "base_url_overrides"), environment
+        ),
     )

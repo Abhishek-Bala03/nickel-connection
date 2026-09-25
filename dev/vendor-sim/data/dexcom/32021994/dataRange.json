@@ -1,0 +1,15 @@
+{
+ "recordType": "dataRange",
+ "recordVersion": "3.0",
+ "userId": "u-32021994",
+ "egvs": {
+  "start": {
+   "systemTime": "2026-01-09T04:30:00",
+   "displayTime": "2026-01-08T21:30:00"
+  },
+  "end": {
+   "systemTime": "2026-01-14T04:25:00",
+   "displayTime": "2026-01-13T21:25:00"
+  }
+ }
+}

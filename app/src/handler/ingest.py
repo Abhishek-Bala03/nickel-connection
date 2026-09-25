@@ -34,6 +34,7 @@ publishes it, or records why it could not).
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -60,7 +61,18 @@ from src.utility.keys import ObjectClass, object_key, parse_tenant_id
 # format -> (content type, sniffer). A PDF header must appear within the first 1024 bytes (ISO 32000-1, 7.5.2).
 FORMATS: dict[str, tuple[str, Callable[[bytes], bool]]] = {
     "pdf": ("application/pdf", lambda data: b"%PDF-" in data[:1024]),
+    # A vendor API response (the Nango connector): a JSON object or array, nothing else.
+    "json": ("application/json", lambda data: _is_json(data)),
 }
+
+
+def _is_json(data: bytes) -> bool:
+    try:
+        return isinstance(json.loads(data), dict | list)
+    except ValueError:
+        return False
+
+
 _PROBLEMS_SHOWN = 5  # a set-aside receipt's reason names at most this many problems
 
 

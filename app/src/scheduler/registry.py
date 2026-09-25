@@ -26,7 +26,10 @@ class ConnectorRegistry:
         self.connectors = [
             ConnectorInfo(
                 id="documents", name="Document jobs API", minimum_interval_seconds=300
-            )
+            ),
+            ConnectorInfo(
+                id="nango", name="Nango — wearables", minimum_interval_seconds=60
+            ),
         ]
         if demo:
             self.connectors.append(
@@ -34,14 +37,27 @@ class ConnectorRegistry:
                     id="demo", name="Demo — simulated", minimum_interval_seconds=30
                 )
             )
-        self.connections = list(connections)
+        # Nango connections are the connectors an administrator added in the connection service,
+        # not this file: approval is that authenticated admin action (docs/scheduler.md).
+        self._approved = list(connections)
+        self._remote: list[Connection] = []
         if len({item.id for item in connections}) != len(connections):
             raise ValueError("Duplicate connection IDs")
         for item in connections:
             if item.connector_type not in {c.id for c in self.connectors}:
                 raise ValueError("Unregistered connector")
+            if item.connector_type == "nango":
+                raise ValueError("Nango connections come from the connection service")
             if item.connector_type == "documents" and item.manifest is None:
                 raise ValueError("Document connections require a manifest ID")
+
+    @property
+    def connections(self) -> list[Connection]:
+        return self._approved + self._remote
+
+    def replace_remote(self, connections: list[Connection]) -> None:
+        """The enabled Nango connectors, as the connection service last listed them."""
+        self._remote = [c for c in connections if c.connector_type == "nango"]
 
     def validate(self, settings: ScheduleSettings) -> Connection:
         connection = next(

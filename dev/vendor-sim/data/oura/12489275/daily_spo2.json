@@ -1,0 +1,661 @@
+{
+ "data": [
+  {
+   "id": "78c7dd7f-042a-443c-a371-41b2675591fd",
+   "day": "2024-08-03",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "599581f9-8d9c-411b-9169-120c92b91ed2",
+   "day": "2024-08-04",
+   "spo2_percentage": {
+    "average": 96.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "4a83b414-92f5-4b18-871e-bf2f125f562b",
+   "day": "2024-08-05",
+   "spo2_percentage": {
+    "average": 97.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "a48aec9e-fb6a-4df7-be05-c22229d852cf",
+   "day": "2024-08-06",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "1cf0a7ac-afcd-4900-bd22-09dc7b7dea8c",
+   "day": "2024-08-07",
+   "spo2_percentage": {
+    "average": 97.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "14745ff9-0420-41a8-b053-edb7997ae22c",
+   "day": "2024-08-08",
+   "spo2_percentage": {
+    "average": 97.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "94228fc2-5d75-4ce4-88bc-b8327eca7593",
+   "day": "2024-08-09",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "e6f9abc4-b89f-4f84-b455-8bcc733d0a5d",
+   "day": "2024-08-10",
+   "spo2_percentage": {
+    "average": 97.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "c1e3f34f-2558-42ce-b12e-89d8194c8ea9",
+   "day": "2024-08-11",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "901b3147-e560-48f2-9e48-a650387c750e",
+   "day": "2024-08-12",
+   "spo2_percentage": {
+    "average": 96.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "2b33198b-1ca6-4899-a7e1-8c75fc70aee9",
+   "day": "2024-08-13",
+   "spo2_percentage": {
+    "average": 97.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "737c4d21-adda-42b7-be72-f76c3075e3d9",
+   "day": "2024-08-14",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "8adb6a46-56a5-428c-adc2-84f78b0bcae6",
+   "day": "2024-08-15",
+   "spo2_percentage": {
+    "average": 97.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "06f1eff4-77e2-41e9-80af-5b89acfd145f",
+   "day": "2024-08-16",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "c4b07a5b-d253-4891-a252-9ff701754e6c",
+   "day": "2024-08-18",
+   "spo2_percentage": {
+    "average": 97.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "791b6154-acd2-4b23-aa2c-93e0fa090e80",
+   "day": "2024-08-19",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "0f14d730-14c9-4ddc-86f5-369d70fa62aa",
+   "day": "2024-08-20",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "c8cd97ba-6fd3-48b2-8113-c146cf8f8009",
+   "day": "2024-08-22",
+   "spo2_percentage": {
+    "average": 96.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "aca5fe58-cd64-4008-a81c-b7c6ef174d55",
+   "day": "2024-08-23",
+   "spo2_percentage": {
+    "average": 97.4
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "6f372fb5-7530-4742-b790-1ddf1e7c8c33",
+   "day": "2024-08-24",
+   "spo2_percentage": {
+    "average": 96.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "03f8d16d-912d-4b75-a103-1aad596f7392",
+   "day": "2024-08-25",
+   "spo2_percentage": {
+    "average": 96.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "3695a061-2e5f-4c3f-87e8-9da098f45cd3",
+   "day": "2024-08-26",
+   "spo2_percentage": {
+    "average": 97.2
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "6a85425c-6af1-42a3-93f3-c88a209d4c1c",
+   "day": "2024-08-27",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "2740fbab-c434-40ff-a067-3e32e80cfd71",
+   "day": "2024-08-28",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "ed401870-c98c-488b-b253-0da0fc3eaddb",
+   "day": "2024-08-29",
+   "spo2_percentage": {
+    "average": 96.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "eec1f795-d9b8-4e34-807b-016ee5247912",
+   "day": "2024-08-30",
+   "spo2_percentage": {
+    "average": 96.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "e36bae5a-6405-4ba2-8464-6863e5b7d795",
+   "day": "2024-08-31",
+   "spo2_percentage": {
+    "average": 97.2
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "9753cfb0-7aba-4322-9210-954bbbc4727d",
+   "day": "2024-09-01",
+   "spo2_percentage": {
+    "average": 97.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "89ab0187-0692-4736-86ba-764d759c9af0",
+   "day": "2024-09-02",
+   "spo2_percentage": {
+    "average": 97.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "150bd897-fb75-4d43-a99a-724f22178d5f",
+   "day": "2024-09-03",
+   "spo2_percentage": {
+    "average": 96.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "ceab566e-9f8a-4247-9273-1e468bc55005",
+   "day": "2024-09-06",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "8465761d-27b8-42cb-90b8-d1c341510b4a",
+   "day": "2024-09-07",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "339d9554-3852-469b-a1ed-5c3399a93a8a",
+   "day": "2024-09-08",
+   "spo2_percentage": {
+    "average": 97.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "b51da3a2-b67c-4267-9843-643cbe61c2d6",
+   "day": "2024-09-09",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "18d41355-b7a7-45d8-a6da-2fc5ddbd81d5",
+   "day": "2024-09-10",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "ef3368c7-be12-4b70-9065-03730bf49d53",
+   "day": "2024-09-11",
+   "spo2_percentage": {
+    "average": 96.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "6157f833-dede-4a2f-b3ed-4082a472755a",
+   "day": "2024-09-12",
+   "spo2_percentage": {
+    "average": 96.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "685f1a8a-e7fa-449b-b6d5-a205dbb6a71a",
+   "day": "2024-09-13",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "754e63ff-aee6-47d1-8f8a-7f4a719736c1",
+   "day": "2024-09-14",
+   "spo2_percentage": {
+    "average": 96.2
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "85845de4-7cbc-4a52-8f67-d4e7f715f4cf",
+   "day": "2024-09-15",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "5756fd73-e0be-4911-ad03-f5dce44fb92d",
+   "day": "2024-09-17",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "69b4362a-f77e-492b-a509-905c521237d9",
+   "day": "2024-09-18",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "4688509c-f411-4776-8335-5b521302caf7",
+   "day": "2024-09-19",
+   "spo2_percentage": {
+    "average": 97.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "ba85fd3b-d5ea-46d9-b769-d6647b1c4717",
+   "day": "2024-09-20",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "2cfe323b-811d-4f54-9e14-12ca69e92f59",
+   "day": "2024-09-21",
+   "spo2_percentage": {
+    "average": 98.2
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "20c3efa1-ccbd-4281-82f4-787bfcb64f20",
+   "day": "2024-09-22",
+   "spo2_percentage": {
+    "average": 97.4
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "c430fcaf-baf1-4390-a818-bf95f2b5833f",
+   "day": "2024-09-23",
+   "spo2_percentage": {
+    "average": 97.4
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "5afce949-13bb-40a7-840b-ed5bd7cd3019",
+   "day": "2024-09-25",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "bc5903ee-a145-4d9d-82b6-91313815774f",
+   "day": "2024-09-26",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "c0649672-9ac3-4ccd-898c-9f90c050a3b3",
+   "day": "2024-09-27",
+   "spo2_percentage": {
+    "average": 97.2
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "2b52f429-472b-459d-bd45-1e0d7b9a48c8",
+   "day": "2024-09-28",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "914a7754-d63b-4743-8296-5c861fed1408",
+   "day": "2024-09-29",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "c13b26ad-7e88-4918-bbaa-cee7a6d10809",
+   "day": "2024-09-30",
+   "spo2_percentage": {
+    "average": 96.4
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "37a4ad4f-d3bd-4c27-8731-a0142a06d2e4",
+   "day": "2024-10-01",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "3cbd2b5e-b90b-442f-abba-58075946cb1d",
+   "day": "2024-10-02",
+   "spo2_percentage": {
+    "average": 96.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "1063401d-e568-4fa3-a6fa-3feb4d9e8193",
+   "day": "2024-10-03",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "2ea5b647-bd0d-47d5-90f3-bb6482c6eeac",
+   "day": "2024-10-04",
+   "spo2_percentage": {
+    "average": 97.5
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "04d658c7-ba9b-476b-b448-c586d9566ad5",
+   "day": "2024-10-05",
+   "spo2_percentage": {
+    "average": 97.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "5891b9a2-b893-4372-90a7-df71ece20622",
+   "day": "2024-10-06",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "5689a4b8-5dd8-4321-896f-f855ddf02627",
+   "day": "2024-10-07",
+   "spo2_percentage": {
+    "average": 97.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "054264c1-85c3-4646-9f92-3a2bab1cd16e",
+   "day": "2024-10-08",
+   "spo2_percentage": {
+    "average": 95.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "edf57164-5d40-4091-8f3b-f8179aedc2e8",
+   "day": "2024-10-09",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "1b39c4d1-004c-4287-b3a4-0cc8232b21f2",
+   "day": "2024-10-10",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "dd39d274-b110-40a2-b7e7-9bbc97ad474b",
+   "day": "2024-10-11",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "41438082-294e-42bd-8585-8cf34c1920c2",
+   "day": "2024-10-12",
+   "spo2_percentage": {
+    "average": 96.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "ab8a337c-22d4-4fb1-9b4a-f3b8ed2191fe",
+   "day": "2024-10-13",
+   "spo2_percentage": {
+    "average": 96.9
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "f26c5bfd-4386-40b7-a3a3-9b581b444d15",
+   "day": "2024-10-14",
+   "spo2_percentage": {
+    "average": 97.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "efd4bc02-6372-4834-bbd9-0e7e4ac8d6e5",
+   "day": "2024-10-15",
+   "spo2_percentage": {
+    "average": 95.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "12624257-c99b-4b4b-9b5b-cafe4c19d799",
+   "day": "2024-10-16",
+   "spo2_percentage": {
+    "average": 96.8
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "fa26fb47-ebeb-4732-a8e1-7999ce5c8a19",
+   "day": "2024-10-18",
+   "spo2_percentage": {
+    "average": 97.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "1ccd6fe5-29f6-430a-be86-fabc34dba104",
+   "day": "2024-10-19",
+   "spo2_percentage": {
+    "average": 96.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "74ccbcfc-fe00-4d85-84f3-b9e6361fe00e",
+   "day": "2024-10-20",
+   "spo2_percentage": {
+    "average": 97.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "3740ddaf-290d-4678-a69a-5e7075e9ebed",
+   "day": "2024-10-21",
+   "spo2_percentage": {
+    "average": 96.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "3bd0a1d4-7aee-4713-bae0-0e32f1b4ed2f",
+   "day": "2024-10-22",
+   "spo2_percentage": {
+    "average": 98.0
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "fa18acdd-a05a-4101-bb30-1ead52e010a5",
+   "day": "2024-10-23",
+   "spo2_percentage": {
+    "average": 97.4
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "345d63bd-b02d-4e37-b41c-327d6f1c1e81",
+   "day": "2024-10-24",
+   "spo2_percentage": {
+    "average": 97.3
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "0aa2da9e-b3d6-4717-8e4a-49baad029751",
+   "day": "2024-10-25",
+   "spo2_percentage": {
+    "average": 97.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "43e22d96-bd90-4fa4-aba0-034a75a32ca5",
+   "day": "2024-10-26",
+   "spo2_percentage": {
+    "average": 96.7
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "3cee5993-408f-49eb-a400-c2ffea537d70",
+   "day": "2024-10-27",
+   "spo2_percentage": {
+    "average": 96.6
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "3b5d0127-ddf5-421f-8189-570751636b4b",
+   "day": "2024-10-28",
+   "spo2_percentage": {
+    "average": 98.2
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "56b6b274-0f56-4765-b6bd-111e0c7e6cbb",
+   "day": "2024-10-29",
+   "spo2_percentage": {
+    "average": 97.1
+   },
+   "breathing_disturbance_index": 7
+  },
+  {
+   "id": "4b339567-1e18-471b-8f7c-2e63da9f2586",
+   "day": "2024-10-30",
+   "spo2_percentage": {
+    "average": 97.2
+   },
+   "breathing_disturbance_index": 7
+  }
+ ],
+ "next_token": null
+}

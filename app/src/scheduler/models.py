@@ -106,3 +106,5 @@ class RunRecord(BaseModel):
     finished_at: AwareDatetime | None = None
     items_processed: int = Field(default=0, strict=True, ge=0)
     error_code: str | None = None
+    # The connection service's job for this run, when one was accepted (schema v2).
+    job_id: str | None = Field(default=None, max_length=64)

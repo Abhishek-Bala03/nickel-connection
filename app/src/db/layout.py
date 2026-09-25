@@ -6,6 +6,7 @@ One place knows the folder names, so the CLI, the jobs and the API all open the 
     <data_dir>/outbox/<topic>.jsonl the JSONL outbox (raw_data)
     <data_dir>/receipts.sqlite     ingest receipts
     <data_dir>/jobs.sqlite         job records for the jobs API
+    <data_dir>/connectors.sqlite   Nango connectors and what each pull stored
 """
 
 from __future__ import annotations
@@ -33,3 +34,7 @@ class DataLayout:
     @property
     def jobs_db(self) -> Path:
         return self.root / "jobs.sqlite"
+
+    @property
+    def connectors_db(self) -> Path:
+        return self.root / "connectors.sqlite"

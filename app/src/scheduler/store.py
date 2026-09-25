@@ -7,7 +7,7 @@ from uuid import UUID
 
 from .models import RunRecord, Schedule
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 _SCHEDULE_INSERT = """
     INSERT INTO schedules (
@@ -26,10 +26,10 @@ _SCHEDULE_INSERT = """
 _RUN_INSERT = """
     INSERT INTO scheduler_runs (
         id, tenant_id, schedule_id, connection_id, status, started_at,
-        finished_at, items_processed, error_code
+        finished_at, items_processed, error_code, job_id
     ) VALUES (
         :id, :tenant_id, :schedule_id, :connection_id, :status, :started_at,
-        :finished_at, :items_processed, :error_code
+        :finished_at, :items_processed, :error_code, :job_id
     )
 """
 
@@ -103,7 +103,16 @@ class ScheduleStore:
                 "SELECT version FROM scheduler_schema WHERE id = 1"
             ).fetchone()
             if version is not None:
-                if version["version"] != _SCHEMA_VERSION:
+                if version["version"] == 1:
+                    # v2: each run keeps the connection service's job id.
+                    self._connection.execute(
+                        "ALTER TABLE scheduler_runs ADD COLUMN job_id TEXT"
+                    )
+                    self._connection.execute(
+                        "UPDATE scheduler_schema SET version = ? WHERE id = 1",
+                        (_SCHEMA_VERSION,),
+                    )
+                elif version["version"] != _SCHEMA_VERSION:
                     raise RuntimeError("Unsupported scheduler database schema version")
                 return
 
@@ -195,6 +204,7 @@ class ScheduleStore:
                 ),
                 items_processed INTEGER NOT NULL CHECK (items_processed >= 0),
                 error_code TEXT,
+                job_id TEXT,
                 CHECK (
                     (status = 'running' AND finished_at IS NULL)
                     OR (status != 'running' AND finished_at IS NOT NULL
@@ -319,7 +329,8 @@ class ScheduleStore:
             cursor = self._connection.execute(
                 """
                 UPDATE scheduler_runs SET status = :status, finished_at = :finished_at,
-                    items_processed = :items_processed, error_code = :error_code
+                    items_processed = :items_processed, error_code = :error_code,
+                    job_id = :job_id
                 WHERE id = :id AND tenant_id = :tenant_id AND status = 'running'
                     AND schedule_id = :schedule_id AND connection_id = :connection_id
                     AND started_at = :started_at

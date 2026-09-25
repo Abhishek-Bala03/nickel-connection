@@ -27,6 +27,28 @@ from .store import ScheduleConflictError, ScheduleStore
 logger = logging.getLogger(__name__)
 
 
+async def refresh_nango_connections(
+    client: httpx.AsyncClient, registry: ConnectorRegistry
+) -> bool:
+    """Take the enabled Nango connectors from the connection service; False when it cannot say."""
+    try:
+        response = await client.get("/connectors", timeout=5)
+        response.raise_for_status()
+        registry.replace_remote(
+            [
+                Connection(id=c["id"], name=c["name"], connector_type="nango")
+                for c in response.json()
+                if c.get("source") == "nango" and c.get("enabled")
+            ]
+        )
+        return True
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+        logger.warning(
+            "scheduler_connectors_unavailable error_type=%s", type(error).__name__
+        )
+        return False
+
+
 @dataclass(frozen=True)
 class Settings:
     service_token: str
@@ -68,9 +90,11 @@ def build_app(
             follow_redirects=False,
             trust_env=False,
         ) as client:
-            connectors = {"documents": JobsConnector(client, registry)}
+            jobs = JobsConnector(client, registry)
+            connectors = {"documents": jobs, "nango": jobs}
             if development:
                 connectors["demo"] = DemoConnector()
+            app.state.client = client
             engine = SchedulerEngine(
                 store, runner or ConnectorRunner(connectors), tenant_id
             )
@@ -78,9 +102,12 @@ def build_app(
             app.state.engine = engine
             try:
                 recover_interrupted_runs(store, tenant_id, datetime.now(UTC))
-                # Refuse unsafe/removed deployment connections before starting jobs.
+                remote = await refresh_nango_connections(client, registry)
+                # Refuse unsafe/removed deployment connections before starting jobs. Nango
+                # schedules are checked when their run starts if the connection service is down.
                 for schedule in store.list_schedules(tenant_id):
-                    registry.validate(schedule)
+                    if schedule.connector_type != "nango" or remote:
+                        registry.validate(schedule)
                 engine.start()
                 yield
             finally:
@@ -117,7 +144,11 @@ def build_app(
             raise HTTPException(422, "Invalid authenticated identity")
         return value
 
-    def validate(settings):
+    async def validate(settings):
+        if settings.connector_type == "nango" and not await refresh_nango_connections(
+            app.state.client, registry
+        ):
+            raise HTTPException(503, "The connection service is unavailable")
         try:
             registry.validate(settings)
         except ValueError as error:
@@ -152,6 +183,7 @@ def build_app(
 
     @router.get("/connections")
     async def connections():
+        await refresh_nango_connections(app.state.client, registry)
         return [
             {"id": c.id, "name": c.name, "connector_type": c.connector_type}
             for c in registry.connections
@@ -167,7 +199,7 @@ def build_app(
     @router.post("/schedules", response_model=Schedule, status_code=201)
     async def create(settings: ScheduleSettings, changed_by: str = Depends(actor)):
         healthy()
-        validate(settings)
+        await validate(settings)
         schedule = Schedule(
             **settings.model_dump(), tenant_id=tenant_id, changed_by=changed_by
         )
@@ -179,7 +211,7 @@ def build_app(
         schedule_id: UUID, settings: ScheduleUpdate, changed_by: str = Depends(actor)
     ):
         healthy()
-        validate(settings)
+        await validate(settings)
         previous = app.state.store.get(tenant_id, schedule_id)
         if previous is None:
             raise HTTPException(404, "Schedule not found")

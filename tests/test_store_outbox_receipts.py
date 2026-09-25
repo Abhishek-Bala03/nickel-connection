@@ -42,6 +42,7 @@ def test_the_data_layout_is_one_root(tmp_path):
         "outbox",
         "receipts_db",
         "jobs_db",
+        "connectors_db",  # Nango connector references and each pull's object refs
     }
 
 

@@ -31,6 +31,26 @@ class RunContext:
 class RunResult:
     items_processed: int
     message: str
+    job_id: str | None = None
+
+
+class ConnectionJobFailedError(RuntimeError):
+    """The connection service ran the job and it failed; its record says why."""
+
+    def __init__(self, job_id: str):
+        super().__init__("Connection job failed")
+        self.job_id = job_id
+
+
+# connector type -> (the jobs API path, the request body for a connection, the count reported)
+_JOB_KINDS = {
+    "documents": (
+        "/jobs/documents/pull",
+        lambda c: {"manifest": c.manifest},
+        "published",
+    ),
+    "nango": ("/jobs/nango/pull", lambda c: {"connector_id": c.id}, "records"),
+}
 
 
 class Connector(Protocol):
@@ -74,25 +94,26 @@ class JobsConnector:
 
     async def run(self, schedule: Schedule, run_id: UUID) -> RunResult:
         connection = self._registry.validate(schedule)
+        path, body, count_key = _JOB_KINDS[connection.connector_type]
         # The outer deadline includes submission, all retries and status polling.
         async with asyncio.timeout(schedule.timeout_seconds):
             job = await self._request(
                 "POST",
-                "/jobs/documents/pull",
+                path,
                 schedule,
                 headers={"Idempotency-Key": str(run_id)},
-                json={"manifest": connection.manifest},
+                json=body(connection),
             )
             job_id = UUID(job["job_id"])
             while True:
                 job = await self._request("GET", f"/jobs/{job_id}", schedule)
                 if job["status"] == "succeeded":
-                    count = job["counts"].get("published", 0)
+                    count = job["counts"].get(count_key, 0)
                     if type(count) is not int or count < 0:
                         raise ValueError("Invalid job result")
-                    return RunResult(count, "Connection job completed")
+                    return RunResult(count, "Connection job completed", str(job_id))
                 if job["status"] == "failed":
-                    raise RuntimeError("Connection job failed")
+                    raise ConnectionJobFailedError(str(job_id))
                 if job["status"] not in {"queued", "running"}:
                     raise ValueError("Invalid job status")
                 await asyncio.sleep(self._poll_seconds)

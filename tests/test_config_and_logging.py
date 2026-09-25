@@ -42,12 +42,16 @@ EVERY_VARIABLE = {
     "NICKEL_S3_SECRET_ACCESS_KEY": "config-test-secret-0123456789abcdef",
     "NICKEL_S3_CA_BUNDLE": str(CONF_FILE),  # any file: the path is checked, not parsed
     "NICKEL_S3_CALL_DEADLINE_SECONDS": "120",
+    "NICKEL_NANGO_URL": "http://nango-server:3003/",
+    "NICKEL_NANGO_SECRET_KEY": "nango-test-secret",
+    "NICKEL_NANGO_BASE_URL_OVERRIDES": "oura=http://vendor-sim:8080/oura/1/, dexcom=http://vendor-sim:8080/dexcom/2",
 }
 # Read from a mounted secret file instead of the variable; tested on their own.
 SECRET_FILES = {
     "NICKEL_SERVICE_TOKEN_FILE",
     "NICKEL_S3_ACCESS_KEY_ID_FILE",
     "NICKEL_S3_SECRET_ACCESS_KEY_FILE",
+    "NICKEL_NANGO_SECRET_KEY_FILE",
 }
 # What production, the default, needs besides: the S3 File Store (http on loopback only), its
 # credentials in mounted files (conftest's), never the variables themselves.
@@ -111,6 +115,36 @@ def test_the_shipped_configuration_reads_every_variable():
         require_https=False,  # development: plain http to a private host is taken
         call_deadline_s=120,
     )
+    assert settings.nango_url == "http://nango-server:3003"
+    assert settings.nango_secret_key == "nango-test-secret"
+    assert "nango-test-secret" not in repr(settings)
+    assert settings.nango_base_url_overrides == {
+        "oura": "http://vendor-sim:8080/oura/1",
+        "dexcom": "http://vendor-sim:8080/dexcom/2",
+    }
+
+
+def test_nango_base_url_overrides_are_for_development_only():
+    with pytest.raises(ValueError, match="for development"):
+        load_settings(
+            CONF_FILE,
+            environ={
+                **PRODUCTION_S3,
+                "NICKEL_NANGO_BASE_URL_OVERRIDES": "oura=http://vendor-sim:8080",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["oura", "Oura=http://x", "oura=ftp://x", "oura=http://x/a?b", "oura=http://x@y"],
+)
+def test_a_malformed_nango_override_is_refused(raw):
+    with pytest.raises(ValueError, match="NICKEL_NANGO_BASE_URL_OVERRIDES"):
+        load_settings(
+            CONF_FILE,
+            environ={**DEVELOPMENT, "NICKEL_NANGO_BASE_URL_OVERRIDES": raw},
+        )
 
 
 def test_the_shipped_configuration_names_no_other_variables():

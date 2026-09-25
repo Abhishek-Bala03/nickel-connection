@@ -1,0 +1,96 @@
+# The Nango wearables demo (docs/demo-nango-wearables.md), on top of compose.yaml:
+#   docker compose -f compose.yaml -f compose.nango.yaml up -d --build
+# Development only: Nango's outbound policy is relaxed to reach vendor-sim on this network, Nango's
+# proxy is pointed at vendor-sim, and the scheduler's port is published on loopback for the Vite UI
+# (nickel-connections-ui). None of that belongs in qa or production. The Keycloak-protected UI
+# gateway stays in compose.scheduler.yaml.
+services:
+  nickel-connection:
+    environment:
+      NICKEL_NANGO_URL: http://nango-server:3003
+      NICKEL_NANGO_SECRET_KEY: ${NANGO_SECRET_KEY_DEV:?set NANGO_SECRET_KEY_DEV in .env}
+      # Each simulated provider's single fixture patient (dev/vendor-sim/data).
+      NICKEL_NANGO_BASE_URL_OVERRIDES: oura=http://vendor-sim:8080/oura/12489275,dexcom=http://vendor-sim:8080/dexcom/32021994
+    depends_on:
+      nango-server:
+        condition: service_healthy
+
+  # APScheduler 3.x: exactly one replica and one Uvicorn worker (docs/scheduler.md).
+  scheduler:
+    image: nickel-connection:dev
+    command: [uvicorn, src.scheduler.api:create_app, --factory, --host, 0.0.0.0, --port, "8000", --workers, "1", --no-server-header]
+    environment:
+      NICKEL_ENV: development
+      NICKEL_TENANT_ID: ${NICKEL_TENANT_ID:?set NICKEL_TENANT_ID in .env}
+      NICKEL_SERVICE_TOKEN: ${NICKEL_SERVICE_TOKEN:?set NICKEL_SERVICE_TOKEN in .env}
+      NICKEL_SCHEDULER_DB: /data/scheduler.sqlite
+      NICKEL_CONNECTION_URL: http://nickel-connection:8000
+    ports:
+      - "127.0.0.1:${SCHEDULER_PORT:-8001}:8000"
+    volumes:
+      - scheduler-data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      nickel-connection:
+        condition: service_healthy
+
+  nango-db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: nango
+      POSTGRES_PASSWORD: ${NANGO_DB_PASSWORD:?set NANGO_DB_PASSWORD in .env}
+      POSTGRES_DB: nango
+    volumes:
+      - nango-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "nango"]
+      interval: 5s
+      retries: 20
+
+  nango-server:
+    # Free self-hosted Nango: auth + proxy only (decision 2). Pinned by digest.
+    image: nangohq/nango-server:hosted-0.71.10@sha256:abcb64936338bd07c923ee8b9203fcacc9ba6b73169d1a2de5423061ecad16f7
+    platform: linux/amd64
+    environment:
+      NANGO_ENCRYPTION_KEY: ${NANGO_ENCRYPTION_KEY:?set NANGO_ENCRYPTION_KEY in .env}
+      NANGO_DB_HOST: nango-db
+      NANGO_DB_USER: nango
+      NANGO_DB_PASSWORD: ${NANGO_DB_PASSWORD}
+      NANGO_DB_NAME: nango
+      NANGO_DB_SSL: "false"
+      RECORDS_DATABASE_URL: postgresql://nango:${NANGO_DB_PASSWORD}@nango-db:5432/nango
+      SERVER_PORT: "3003"
+      NANGO_SERVER_URL: http://localhost:3003
+      NANGO_PUBLIC_SERVER_URL: http://localhost:3003
+      # The dashboard asks for NANGO_DASHBOARD_USERNAME / _PASSWORD (basic auth).
+      FLAG_AUTH_ENABLED: "false"
+      NANGO_DASHBOARD_USERNAME: ${NANGO_DASHBOARD_USERNAME:-admin}
+      NANGO_DASHBOARD_PASSWORD: ${NANGO_DASHBOARD_PASSWORD:?set NANGO_DASHBOARD_PASSWORD in .env}
+      NANGO_LOGS_ENABLED: "false"
+      # The dev environment's secret key (a UUID v4), shared with nickel-connection.
+      NANGO_SECRET_KEY_DEV: ${NANGO_SECRET_KEY_DEV:?set NANGO_SECRET_KEY_DEV in .env}
+      # vendor-sim has a private Docker address; the default policy blocks those.
+      NANGO_OUTBOUND_URL_POLICY: '{"blockPrivateIps":false}'
+    ports:
+      - "127.0.0.1:${NANGO_PORT:-3003}:3003"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3003/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+      interval: 5s
+      retries: 40
+    depends_on:
+      nango-db:
+        condition: service_healthy
+
+  # Stands in for api.ouraring.com and api.dexcom.com with the simulator's synthetic patients.
+  vendor-sim:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./dev/vendor-sim/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./dev/vendor-sim/data:/data:ro
+
+volumes:
+  scheduler-data:
+  nango-db:

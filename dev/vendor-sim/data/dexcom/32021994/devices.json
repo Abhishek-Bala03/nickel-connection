@@ -1,0 +1,56 @@
+{
+ "recordType": "device",
+ "recordVersion": "3.0",
+ "userId": "u-32021994",
+ "records": [
+  {
+   "lastUploadDate": "2026-01-14T00:00:00",
+   "transmitterId": "8296C6",
+   "transmitterGeneration": "g6",
+   "displayDevice": "iOS",
+   "alertSchedules": [
+    {
+     "alertScheduleSettings": {
+      "alertScheduleName": "Default",
+      "isEnabled": true,
+      "isDefaultSchedule": true,
+      "startTime": "00:00",
+      "endTime": "00:00",
+      "daysOfWeek": [
+       "sunday",
+       "monday",
+       "tuesday",
+       "wednesday",
+       "thursday",
+       "friday",
+       "saturday"
+      ]
+     },
+     "alertSettings": [
+      {
+       "alertName": "low",
+       "value": 70,
+       "unit": "mg/dL",
+       "snooze": 30,
+       "enabled": true
+      },
+      {
+       "alertName": "high",
+       "value": 250,
+       "unit": "mg/dL",
+       "snooze": 0,
+       "enabled": true
+      },
+      {
+       "alertName": "urgentLow",
+       "value": 55,
+       "unit": "mg/dL",
+       "snooze": 0,
+       "enabled": true
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}
