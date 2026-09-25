@@ -1,568 +1,589 @@
-"""Tests for scheduling, execution history, and concurrency limits."""
+"""APScheduler lifecycle, execution, deadlines, and failure isolation tests."""
 
-from concurrent.futures import Future
+import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import uuid4
 
 import pytest
+from apscheduler.events import EVENT_JOB_ERROR, JobExecutionEvent
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
-from nickel_connection.scheduler.engine import RunUnavailableError, SchedulerEngine
-from nickel_connection.scheduler.models import Schedule
-from nickel_connection.scheduler.runner import (
-    ConnectorRunner,
-    ConnectorTimeoutError,
-    DemoConnector,
-    RetryableConnectorError,
-    RunResult,
-)
-from nickel_connection.scheduler.store import ScheduleStore
+from src.scheduler.engine import RunUnavailableError, SchedulerEngine
+from src.scheduler.models import Schedule
+from src.scheduler.runner import ConnectorTimeoutError, RunResult
+from src.scheduler.store import ScheduleStore
 
-NOW = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
-TENANT_ID = UUID("00000000-0000-4000-8000-000000000001")
-
-
-class FakeExecutor:
-    """Capture submissions and let tests control completion."""
-
-    def __init__(self):
-        self.jobs = []
-        self.fail_submission = False
-        self.stopped = False
-
-    def submit(self, function, *args):
-        if self.fail_submission:
-            raise RuntimeError("Executor unavailable")
-
-        future = Future()
-        self.jobs.append((future, function, args))
-        return future
-
-    def shutdown(self, wait=True):
-        self.stopped = True
-        for future, function, args in self.jobs:
-            if not future.done():
-                try:
-                    future.set_result(function(*args))
-                except Exception as error:
-                    future.set_exception(error)
+pytestmark = pytest.mark.anyio
 
 
 @pytest.fixture
-def setup(tmp_path):
+def anyio_backend():
+    return "asyncio"
+
+
+class AsyncRunnerStub:
+    """Controllable async I/O without real network requests."""
+
+    def __init__(self):
+        self.calls = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.block = False
+        self.cancelled = False
+        self.error = None
+        self.result = RunResult(items_processed=5, message="Completed")
+
+    async def run(self, schedule, run_id):
+        self.calls.append((schedule, run_id))
+        self.started.set()
+        try:
+            if self.block:
+                await self.release.wait()
+            if self.error is not None:
+                raise self.error
+            return self.result
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+@pytest.fixture
+def tenant_id():
+    return uuid4()
+
+
+@pytest.fixture
+def schedule(tenant_id):
+    return Schedule(
+        tenant_id=tenant_id,
+        name="Demo source",
+        connector_type="demo",
+        connection_id="demo-connection",
+        interval_seconds=3600,
+    )
+
+
+@pytest.fixture
+async def runtime(tmp_path, tenant_id):
     store = ScheduleStore(tmp_path / "scheduler.db")
-    executor = FakeExecutor()
-    current_time = [NOW]
-    runner = ConnectorRunner({"demo": DemoConnector()})
-    engine = SchedulerEngine(
-        store,
-        runner,
-        TENANT_ID,
-        max_workers=2,
-        clock=lambda: current_time[0],
-        monotonic_clock=lambda: (current_time[0] - NOW).total_seconds(),
-        executor=executor,
-    )
-
-    yield store, engine, executor, current_time
-
-    engine.close()
-    store.close()
+    runner = AsyncRunnerStub()
+    engine = SchedulerEngine(store, runner, tenant_id)
+    engine.start()
+    try:
+        yield store, engine, runner
+    finally:
+        await engine.close()
+        store.close()
 
 
-def make_schedule(number=1, **changes):
-    values = {
-        "id": UUID(int=number),
-        "tenant_id": TENANT_ID,
-        "name": f"Source {number}",
-        "connector_type": "demo",
-        "connection_id": f"connection-{number}",
-        "interval_seconds": 30,
-        "next_run_at": NOW,
-    }
-    values.update(changes)
-    return Schedule(**values)
-
-
-def test_due_schedule_starts_and_advances_next_run(setup):
-    store, engine, executor, _ = setup
-    schedule = make_schedule()
+def add_schedule(runtime, schedule):
+    store, engine, _ = runtime
     store.add(schedule)
-
-    started = engine.tick()
-
-    assert len(started) == 1
-    assert started[0].status == "running"
-    assert len(executor.jobs) == 1
-
-    saved = store.get(TENANT_ID, schedule.id)
-    assert saved is not None
-    assert saved.next_run_at == NOW + timedelta(seconds=30)
-
-
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"enabled": False},
-        {"next_run_at": NOW + timedelta(seconds=1)},
-        {"tenant_id": UUID(int=999)},
-    ],
-)
-def test_skip_disabled_future_and_other_tenant_schedules(setup, changes):
-    store, engine, executor, _ = setup
-    store.add(make_schedule(**changes))
-
-    assert engine.tick() == []
-    assert executor.jobs == []
-
-
-def test_success_is_saved_on_next_tick(setup):
-    store, engine, executor, current_time = setup
-    store.add(make_schedule())
-    engine.tick()
-
-    executor.jobs[0][0].set_result(RunResult(items_processed=5, message="Completed"))
-    current_time[0] = NOW + timedelta(seconds=1)
-    engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "succeeded"
-    assert record.items_processed == 5
-    assert record.finished_at == current_time[0]
-    assert record.error_code is None
-
-
-def test_failure_records_safe_error_code(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule())
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(
-        ConnectionError("private-token-must-not-be-saved")
-    )
-    engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "connector_failed"
-    assert "private-token" not in record.model_dump_json()
-
-
-def test_running_connection_does_not_overlap(setup):
-    store, engine, executor, current_time = setup
-    store.add(make_schedule())
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=60)
-
-    assert engine.tick() == []
-    assert len(executor.jobs) == 1
-
-
-def test_concurrency_limit_leaves_remaining_job_due(setup):
-    store, engine, executor, _ = setup
-    for number in range(1, 4):
-        store.add(make_schedule(number))
-
-    assert len(engine.tick()) == 2
-    assert len(executor.jobs) == 2
-
-    waiting = store.get(TENANT_ID, UUID(int=3))
-    assert waiting is not None
-    assert waiting.next_run_at == NOW
-
-    executor.jobs[0][0].set_result(RunResult(items_processed=0, message="Completed"))
-
-    started = engine.tick()
-
-    assert len(started) == 1
-    assert started[0].schedule_id == UUID(int=3)
-
-
-def test_missed_intervals_produce_one_run(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule(next_run_at=NOW - timedelta(hours=1)))
-
-    assert len(engine.tick()) == 1
-    assert engine.tick() == []
-    assert len(executor.jobs) == 1
-
-    saved = store.get(TENANT_ID, UUID(int=1))
-    assert saved is not None
-    assert saved.next_run_at == NOW + timedelta(seconds=30)
-
-
-def test_schedule_runs_again_after_completion_and_interval(setup):
-    store, engine, executor, current_time = setup
-    store.add(make_schedule())
-    engine.tick()
-    executor.jobs[0][0].set_result(RunResult(items_processed=0, message="Completed"))
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=30)
-
-    assert len(engine.tick()) == 1
-    assert len(store.list_runs(TENANT_ID)) == 2
-
-
-def test_dispatch_failure_releases_connection(setup):
-    store, engine, executor, _ = setup
-    schedule = make_schedule()
-    store.add(schedule)
-    executor.fail_submission = True
-
-    with pytest.raises(RuntimeError, match="Executor unavailable"):
-        engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "dispatch_failed"
-    assert store.start_run(schedule, NOW) is not None
-
-
-def test_close_collects_results_and_prevents_further_ticks(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule())
-    engine.tick()
-
-    engine.close()
-    engine.close()
-
-    assert executor.stopped is True
-    assert store.list_runs(TENANT_ID)[0].status == "succeeded"
-
-    with pytest.raises(RuntimeError, match="closed"):
-        engine.tick()
-
-
-def test_invalid_worker_count_is_rejected(setup):
-    store, _, _, _ = setup
-
-    with pytest.raises(ValueError, match="max_workers"):
-        SchedulerEngine(
-            store,
-            ConnectorRunner({}),
-            TENANT_ID,
-            max_workers=0,
-        )
-
-
-def test_default_executor_can_start_and_close(setup):
-    store, _, _, _ = setup
-    engine = SchedulerEngine(
-        store,
-        ConnectorRunner({}),
-        TENANT_ID,
-    )
-
-    assert engine.tick() == []
-    engine.close()
-
-
-def test_retry_waits_then_succeeds_with_same_run_id(setup):
-    store, engine, executor, current_time = setup
-    schedule = make_schedule(max_retries=1, retry_delay_seconds=5)
-    store.add(schedule)
-
-    started = engine.tick()
-    run_id = started[0].id
-    executor.jobs[0][0].set_exception(RetryableConnectorError("Temporary failure"))
-    engine.tick()
-
-    assert len(executor.jobs) == 1
-    assert store.list_runs(TENANT_ID)[0].status == "running"
-    assert store.start_run(schedule, NOW) is None
-
-    current_time[0] = NOW + timedelta(seconds=4)
-    engine.tick()
-    assert len(executor.jobs) == 1
-
-    current_time[0] = NOW + timedelta(seconds=5)
-    engine.tick()
-    assert len(executor.jobs) == 2
-    assert executor.jobs[1][2][1] == run_id
-
-    executor.jobs[1][0].set_result(RunResult(items_processed=3, message="Completed"))
-    engine.tick()
-
-    records = store.list_runs(TENANT_ID)
-    assert len(records) == 1
-    assert records[0].id == run_id
-    assert records[0].status == "succeeded"
-    assert records[0].items_processed == 3
-
-
-def test_retry_backoff_doubles_and_stops_at_limit(setup):
-    store, engine, executor, current_time = setup
-    store.add(
-        make_schedule(
-            max_retries=2,
-            retry_delay_seconds=5,
-            interval_seconds=300,
-        )
-    )
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(RetryableConnectorError())
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=5)
-    engine.tick()
-    executor.jobs[1][0].set_exception(RetryableConnectorError())
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=14)
-    engine.tick()
-    assert len(executor.jobs) == 2
-
-    current_time[0] = NOW + timedelta(seconds=15)
-    engine.tick()
-    assert len(executor.jobs) == 3
-
-    executor.jobs[2][0].set_exception(RetryableConnectorError())
-    engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "connector_failed"
-
-    current_time[0] = NOW + timedelta(seconds=60)
-    engine.tick()
-    assert len(executor.jobs) == 3
-
-
-def test_retryable_failure_with_retries_disabled_finishes(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule(max_retries=0))
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(RetryableConnectorError())
-    engine.tick()
-
-    assert len(executor.jobs) == 1
-    assert store.list_runs(TENANT_ID)[0].status == "failed"
-
-
-def test_non_retryable_failure_is_not_retried(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule(max_retries=2))
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(ValueError("Invalid configuration"))
-    engine.tick()
-
-    assert len(executor.jobs) == 1
-    assert store.list_runs(TENANT_ID)[0].status == "failed"
-
-
-def test_retry_submission_failure_finishes_run(setup):
-    store, engine, executor, current_time = setup
-    store.add(make_schedule(max_retries=1))
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(RetryableConnectorError())
-    engine.tick()
-
-    executor.fail_submission = True
-    current_time[0] = NOW + timedelta(seconds=5)
-
-    with pytest.raises(RuntimeError, match="Executor unavailable"):
-        engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "dispatch_failed"
-
-
-def test_close_interrupts_waiting_retry_and_releases_connection(setup):
-    store, engine, executor, _ = setup
-    schedule = make_schedule(max_retries=1)
-    store.add(schedule)
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(RetryableConnectorError())
-    engine.tick()
-    engine.close()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "interrupted"
-    assert record.error_code == "scheduler_stopped"
-    assert store.start_run(schedule, NOW) is not None
-
-
-def test_close_does_not_start_new_retries(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule(max_retries=2))
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(RetryableConnectorError())
-    engine.close()
-
-    assert len(executor.jobs) == 1
-    assert store.list_runs(TENANT_ID)[0].status == "failed"
-
-
-def test_schedule_update_failure_releases_reservation(setup, monkeypatch):
-    store, engine, executor, _ = setup
-    schedule = make_schedule()
-    store.add(schedule)
-
-    def fail_update(schedule):
-        raise RuntimeError("Storage unavailable")
-
-    monkeypatch.setattr(store, "update", fail_update)
-
-    with pytest.raises(RuntimeError, match="Storage unavailable"):
-        engine.tick()
-
-    assert executor.jobs == []
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "dispatch_failed"
-    assert store.start_run(schedule, NOW) is not None
-
-
-def test_overdue_worker_keeps_reservation_until_it_exits(setup):
-    store, engine, executor, current_time = setup
-    schedule = make_schedule(
-        timeout_seconds=5,
-        interval_seconds=300,
-    )
-    store.add(schedule)
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=6)
-    engine.tick()
-
-    assert store.list_runs(TENANT_ID)[0].status == "running"
-    assert store.start_run(schedule, current_time[0]) is None
-    assert len(executor.jobs) == 1
-
-    executor.jobs[0][0].set_result(RunResult(items_processed=5, message="Late result"))
-    engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "connector_timeout"
-    assert record.items_processed == 0
-    assert store.start_run(schedule, current_time[0]) is not None
-
-
-def test_timely_result_remains_successful_when_collected_later(setup):
-    store, engine, executor, current_time = setup
-    store.add(make_schedule(timeout_seconds=5, interval_seconds=300))
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=4)
-    executor.jobs[0][0].set_result(RunResult(items_processed=2, message="Completed"))
-
-    current_time[0] = NOW + timedelta(seconds=20)
-    engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "succeeded"
-    assert record.items_processed == 2
-
-
-def test_timeout_retry_gets_a_new_attempt_deadline(setup):
-    store, engine, executor, current_time = setup
-    store.add(
-        make_schedule(
-            timeout_seconds=5,
-            max_retries=1,
-            retry_delay_seconds=2,
-            interval_seconds=300,
-        )
-    )
-    engine.tick()
-
-    current_time[0] = NOW + timedelta(seconds=5)
-    executor.jobs[0][0].set_result(RunResult(items_processed=1, message="Too late"))
-    engine.tick()
-
-    assert len(executor.jobs) == 1
-    assert store.list_runs(TENANT_ID)[0].status == "running"
-
-    current_time[0] = NOW + timedelta(seconds=7)
-    engine.tick()
-    assert len(executor.jobs) == 2
-
-    current_time[0] = NOW + timedelta(seconds=8)
-    executor.jobs[1][0].set_result(RunResult(items_processed=3, message="Completed"))
-    engine.tick()
-
-    records = store.list_runs(TENANT_ID)
-    assert len(records) == 1
-    assert records[0].status == "succeeded"
-    assert records[0].items_processed == 3
-
-
-def test_connector_reported_timeout_is_recorded(setup):
-    store, engine, executor, _ = setup
-    store.add(make_schedule())
-    engine.tick()
-
-    executor.jobs[0][0].set_exception(ConnectorTimeoutError())
-    engine.tick()
-
-    record = store.list_runs(TENANT_ID)[0]
-    assert record.status == "failed"
-    assert record.error_code == "connector_timeout"
-
-
-def test_manual_run_starts_before_due_time(setup):
-    store, engine, executor, _ = setup
-    schedule = make_schedule(next_run_at=NOW + timedelta(hours=1))
-    store.add(schedule)
-
-    record = engine.run_now(schedule.id)
-
-    assert record.schedule_id == schedule.id
-    assert len(executor.jobs) == 1
-    saved = store.get(TENANT_ID, schedule.id)
-    assert saved.next_run_at == NOW + timedelta(seconds=30)
-
-
-def test_manual_run_rejects_missing_schedule(setup):
-    _, engine, _, _ = setup
-
-    with pytest.raises(KeyError):
-        engine.run_now(UUID(int=999))
-
-
-def test_manual_run_rejects_disabled_schedule(setup):
-    store, engine, _, _ = setup
-    schedule = make_schedule(enabled=False)
-    store.add(schedule)
-
+    return engine.sync_schedule(schedule)
+
+
+async def wait_for_run(store, tenant_id, run_id):
+    async with asyncio.timeout(3):
+        while True:
+            record = next(
+                item for item in store.list_runs(tenant_id) if item.id == run_id
+            )
+            if record.status != "running":
+                return record
+            await asyncio.sleep(0.005)
+
+
+async def wait_for_tasks(engine):
+    async with asyncio.timeout(3):
+        while engine._tasks:
+            await asyncio.sleep(0.005)
+
+
+async def test_sync_runner_is_rejected(runtime, tenant_id):
+    class SyncRunner:
+        def run(self, schedule, run_id):
+            return RunResult(items_processed=0, message="Sync")
+
+    store, _, _ = runtime
+    with pytest.raises(TypeError, match="asynchronous"):
+        SchedulerEngine(store, SyncRunner(), tenant_id)
+
+
+@pytest.mark.parametrize("days", [0, -1, 3651, True, 1.5, "30"])
+async def test_invalid_retention_is_rejected(runtime, tenant_id, days):
+    store, _, runner = runtime
+    with pytest.raises(ValueError, match="retention_days"):
+        SchedulerEngine(store, runner, tenant_id, retention_days=days)
+
+
+async def test_start_rebuilds_only_tenant_jobs_from_database(tmp_path, schedule):
+    path = tmp_path / "rebuild.db"
+    original = ScheduleStore(path)
+    paused = schedule.model_copy(update={"id": uuid4(), "enabled": False})
+    foreign = schedule.model_copy(update={"id": uuid4(), "tenant_id": uuid4()})
+    for item in (schedule, paused, foreign):
+        original.add(item)
+    original.close()
+
+    store = ScheduleStore(path)
+    engine = SchedulerEngine(store, AsyncRunnerStub(), schedule.tenant_id)
+    try:
+        assert not engine.healthy
+        engine.start()
+        assert engine.healthy
+        assert engine.with_next_run(schedule).next_run_at is not None
+        assert engine.with_next_run(paused).next_run_at is None
+        assert engine._scheduler.get_job(str(foreign.id)) is None
+        assert isinstance(engine._scheduler._jobstores["default"], MemoryJobStore)
+        assert store.get(schedule.tenant_id, schedule.id).next_run_at is None
+        assert len(engine._scheduler.get_jobs()) == 3
+    finally:
+        await engine.close()
+        store.close()
+
+
+async def test_interval_job_uses_coalescing_and_one_instance(runtime, schedule):
+    _, engine, _ = runtime
+    result = add_schedule(runtime, schedule)
+    job = engine._scheduler.get_job(str(schedule.id))
+
+    assert isinstance(job.trigger, IntervalTrigger)
+    assert job.max_instances == 1
+    assert job.coalesce is True
+    assert job.misfire_grace_time == schedule.interval_seconds
+    assert result.next_run_at == job.next_run_time
+    assert schedule.next_run_at is None
+
+
+async def test_cron_job_uses_utc(runtime, schedule):
+    _, engine, _ = runtime
+    data = schedule.model_dump()
+    data.update(trigger_type="cron", interval_seconds=None, cron_expression="0 9 * * *")
+    cron = Schedule.model_validate(data)
+    result = add_schedule(runtime, cron)
+    job = engine._scheduler.get_job(str(cron.id))
+
+    assert isinstance(job.trigger, CronTrigger)
+    assert job.misfire_grace_time == 60
+    assert result.next_run_at.hour == 9
+    assert result.next_run_at.minute == 0
+    assert result.next_run_at.utcoffset() == timedelta(0)
+
+
+async def test_unchanged_trigger_keeps_next_run_and_replaces_job(runtime, schedule):
+    store, engine, _ = runtime
+    original = add_schedule(runtime, schedule)
+    schedule.name = "Renamed"
+    updated = store.update(schedule)
+    result = engine.sync_schedule(updated)
+
+    assert result.next_run_at == original.next_run_at
+    assert len(engine._scheduler.get_jobs()) == 2
+    assert store.get(schedule.tenant_id, schedule.id).version == 2
+
+
+async def test_interval_change_reschedules_job(runtime, schedule):
+    store, engine, _ = runtime
+    original = add_schedule(runtime, schedule)
+    schedule.interval_seconds = 7200
+    result = engine.sync_schedule(store.update(schedule))
+
+    assert result.next_run_at > original.next_run_at
+    assert engine._scheduler.get_job(str(schedule.id)).misfire_grace_time == 7200
+
+
+async def test_pause_and_resume(runtime, schedule):
+    store, engine, _ = runtime
+    add_schedule(runtime, schedule)
+    schedule.enabled = False
+    paused = store.update(schedule)
+    assert engine.sync_schedule(paused).next_run_at is None
+
+    paused.enabled = True
+    resumed = store.update(paused)
+    assert engine.sync_schedule(resumed).next_run_at is not None
+
+
+async def test_unknown_runtime_job_has_no_next_run(runtime, schedule):
+    _, engine, _ = runtime
+    assert engine.with_next_run(schedule).next_run_at is None
+
+
+async def test_foreign_schedule_cannot_be_registered_or_read(runtime, schedule):
+    _, engine, _ = runtime
+    schedule.tenant_id = uuid4()
+    with pytest.raises(ValueError, match="different tenant"):
+        engine.sync_schedule(schedule)
+    with pytest.raises(ValueError, match="different tenant"):
+        engine.with_next_run(schedule)
+
+
+async def test_manual_run_saves_result_without_changing_configuration(
+    runtime, schedule
+):
+    store, engine, runner = runtime
+    configured = add_schedule(runtime, schedule)
+    accepted = engine.run_now(schedule.id)
+
+    assert accepted.status == "running"
+    result = await wait_for_run(store, schedule.tenant_id, accepted.id)
+
+    assert result.status == "succeeded"
+    assert result.items_processed == 5
+    assert result.error_code is None
+    assert result.finished_at >= result.started_at
+    assert runner.calls[0][1] == accepted.id
+    assert accepted.status == "running"
+    assert store.get(schedule.tenant_id, schedule.id).version == 1
+    assert engine.with_next_run(schedule).next_run_at == configured.next_run_at
+
+
+async def test_manual_run_rejects_missing_and_foreign_schedule(runtime, schedule):
+    store, engine, _ = runtime
+    with pytest.raises(KeyError, match="Schedule not found"):
+        engine.run_now(uuid4())
+    foreign = schedule.model_copy(update={"tenant_id": uuid4()})
+    store.add(foreign)
+    with pytest.raises(KeyError, match="Schedule not found"):
+        engine.run_now(foreign.id)
+
+
+async def test_manual_run_rejects_disabled_schedule(runtime, schedule):
+    _, engine, _ = runtime
+    schedule.enabled = False
+    add_schedule(runtime, schedule)
     with pytest.raises(RunUnavailableError, match="Enable"):
         engine.run_now(schedule.id)
 
 
-def test_manual_run_rejects_overlapping_connection(setup):
-    store, engine, _, _ = setup
-    schedule = make_schedule()
-    store.add(schedule)
-    engine.run_now(schedule.id)
-
-    with pytest.raises(RunUnavailableError, match="active run"):
+async def test_manual_run_rejects_paused_scheduler(runtime, schedule):
+    _, engine, _ = runtime
+    add_schedule(runtime, schedule)
+    engine._scheduler.pause()
+    assert not engine.healthy
+    with pytest.raises(RunUnavailableError, match="unavailable"):
         engine.run_now(schedule.id)
 
 
-def test_manual_run_respects_capacity(setup):
-    store, engine, _, _ = setup
-    for number in range(1, 4):
-        store.add(make_schedule(number))
+async def test_manual_and_scheduled_runs_share_connection_reservation(
+    runtime, schedule
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    second = schedule.model_copy(update={"id": uuid4()})
+    add_schedule(runtime, second)
+    runner.block = True
+    accepted = engine.run_now(schedule.id)
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
 
-    engine.run_now(UUID(int=1))
-    engine.run_now(UUID(int=2))
+    with pytest.raises(RunUnavailableError, match="active run"):
+        engine.run_now(second.id)
+    await engine._run_scheduled(second.id)
 
-    with pytest.raises(RunUnavailableError, match="capacity"):
-        engine.run_now(UUID(int=3))
+    assert len(runner.calls) == 1
+    assert len(store.list_runs(schedule.tenant_id)) == 1
+    runner.release.set()
+    await wait_for_run(store, schedule.tenant_id, accepted.id)
 
 
-def test_manual_run_rejects_closed_engine(setup):
-    _, engine, _, _ = setup
-    engine.close()
+async def test_apscheduler_really_fires_and_coalesces_missed_intervals(
+    runtime, schedule
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    engine._scheduler.modify_job(
+        str(schedule.id),
+        next_run_time=datetime.now(UTC) - timedelta(hours=3, milliseconds=10),
+    )
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
+    await wait_for_run(store, schedule.tenant_id, runner.calls[0][1])
 
+    assert len(runner.calls) == 1
+    assert engine.with_next_run(schedule).next_run_at > datetime.now(UTC)
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_scheduled_callback_rechecks_database(runtime, schedule, disabled):
+    store, engine, runner = runtime
+    if disabled:
+        schedule.enabled = False
+        store.add(schedule)
+    await engine._run_scheduled(schedule.id)
+    assert runner.calls == []
+    assert store.list_runs(schedule.tenant_id) == []
+
+
+async def test_transient_dispatch_error_does_not_stop_future_runs(
+    runtime, schedule, monkeypatch, caplog
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    original = store.get
+
+    def fail_once(*args):
+        raise sqlite3.OperationalError("private-token-do-not-log")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "get", fail_once)
+        await engine._run_scheduled(schedule.id)
+
+    assert store.get == original
+    assert engine.healthy
+    assert "OperationalError" in caplog.text
+    assert "private-token" not in caplog.text
+    await engine._run_scheduled(schedule.id)
+    assert len(runner.calls) == 1
+    assert store.list_runs(schedule.tenant_id)[0].status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("private-token"), ConnectionError("private-token")]
+)
+async def test_runner_failure_is_recorded_without_secret_text(
+    runtime, schedule, error, caplog
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    runner.error = error
+    accepted = engine.run_now(schedule.id)
+    failed = await wait_for_run(store, schedule.tenant_id, accepted.id)
+
+    assert failed.status == "failed"
+    assert failed.error_code == "connector_failed"
+    assert "private-token" not in failed.model_dump_json()
+    assert "private-token" not in caplog.text
+    assert engine.healthy
+
+    runner.error = None
+    next_run = engine.run_now(schedule.id)
+    assert (
+        await wait_for_run(store, schedule.tenant_id, next_run.id)
+    ).status == "succeeded"
+
+
+async def test_invalid_processed_count_is_a_failed_run(runtime, schedule):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    runner.result = RunResult(items_processed=-1, message="Invalid")
+    accepted = engine.run_now(schedule.id)
+    failed = await wait_for_run(store, schedule.tenant_id, accepted.id)
+    assert failed.error_code == "connector_failed"
+    assert failed.items_processed == 0
+
+
+async def test_deadline_cancels_waiting_async_io(runtime, schedule):
+    store, engine, runner = runtime
+    schedule.timeout_seconds = 1
+    add_schedule(runtime, schedule)
+    runner.block = True
+    accepted = engine.run_now(schedule.id)
+    result = await wait_for_run(store, schedule.tenant_id, accepted.id)
+
+    assert runner.cancelled
+    assert result.status == "failed"
+    assert result.error_code == "connector_timeout"
+    assert store.list_running_runs(schedule.tenant_id) == []
+    assert len(runner.calls) == 1
+
+
+async def test_runner_reported_timeout_is_recorded(runtime, schedule):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    runner.error = ConnectorTimeoutError("private-token")
+    accepted = engine.run_now(schedule.id)
+    assert (
+        await wait_for_run(store, schedule.tenant_id, accepted.id)
+    ).error_code == "connector_timeout"
+
+
+async def test_returned_result_is_not_discarded_after_wall_clock_jump(
+    runtime, schedule, monkeypatch
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    runner.block = True
+    now = datetime.now(UTC)
+    monkeypatch.setattr(engine, "_clock", lambda: now)
+    accepted = engine.run_now(schedule.id)
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
+    now += timedelta(hours=1)
+    runner.release.set()
+    result = await wait_for_run(store, schedule.tenant_id, accepted.id)
+    assert result.status == "succeeded"
+    assert result.items_processed == 5
+
+
+async def test_transient_history_error_retries_save_without_refetching(
+    runtime, schedule, monkeypatch, caplog
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    original = store.finish_run
+    attempts = []
+
+    def fail_once(record):
+        attempts.append(record.id)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("private-token")
+        original(record)
+
+    monkeypatch.setattr(store, "finish_run", fail_once)
+    accepted = engine.run_now(schedule.id)
+    result = await wait_for_run(store, schedule.tenant_id, accepted.id)
+    assert result.status == "succeeded"
+    assert attempts == [accepted.id, accepted.id]
+    assert len(runner.calls) == 1
+    assert "private-token" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error", [sqlite3.OperationalError("private-token"), RuntimeError("private-token")]
+)
+async def test_failed_history_write_keeps_reservation_and_other_jobs_work(
+    runtime, schedule, monkeypatch, error, caplog
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    attempts = []
+
+    def fail_save(record):
+        attempts.append(record.id)
+        raise error
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "finish_run", fail_save)
+        accepted = engine.run_now(schedule.id)
+        await wait_for_tasks(engine)
+
+    assert len(attempts) == (3 if isinstance(error, sqlite3.OperationalError) else 1)
+    assert store.list_running_runs(schedule.tenant_id)[0].id == accepted.id
+    assert len(runner.calls) == 1
+    assert "private-token" not in caplog.text
+    with pytest.raises(RunUnavailableError, match="active run"):
+        engine.run_now(schedule.id)
+
+    other = schedule.model_copy(update={"id": uuid4(), "connection_id": "other"})
+    add_schedule(runtime, other)
+    next_run = engine.run_now(other.id)
+    assert (
+        await wait_for_run(store, other.tenant_id, next_run.id)
+    ).status == "succeeded"
+    assert engine.healthy
+
+
+async def test_retention_job_removes_only_expired_finished_history(runtime, schedule):
+    store, engine, _ = runtime
+    now = datetime.now(UTC)
+    old = store.start_run(schedule, now - timedelta(days=31))
+    old.status = "succeeded"
+    old.finished_at = old.started_at
+    store.finish_run(old)
+    active = store.start_run(schedule, now - timedelta(days=40))
+
+    await engine._prune_history()
+
+    assert store.list_runs(schedule.tenant_id) == [active]
+    assert engine._scheduler.get_job("history-retention") is not None
+
+
+async def test_retention_failure_is_logged_without_stopping_scheduler(
+    runtime, monkeypatch, caplog
+):
+    store, engine, _ = runtime
+
+    def fail_prune(*args):
+        raise sqlite3.OperationalError("private-token")
+
+    monkeypatch.setattr(store, "prune_runs", fail_prune)
+    await engine._prune_history()
+    assert engine.healthy
+    assert "scheduler_retention_failed" in caplog.text
+    assert "private-token" not in caplog.text
+
+
+async def test_job_error_listener_logs_only_exception_type(runtime, caplog):
+    _, engine, _ = runtime
+    event = JobExecutionEvent(
+        EVENT_JOB_ERROR,
+        "probe",
+        "default",
+        datetime.now(UTC),
+        exception=ValueError("private-token"),
+    )
+    engine._scheduler._dispatch_event(event)
+    assert "scheduler_job_error error_type=ValueError" in caplog.text
+    assert "private-token" not in caplog.text
+
+
+async def test_close_cancels_active_manual_run(runtime, schedule):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    runner.block = True
+    accepted = engine.run_now(schedule.id)
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
+
+    await asyncio.wait_for(engine.close(), timeout=2)
+
+    result = store.list_runs(schedule.tenant_id)[0]
+    assert result.id == accepted.id
+    assert result.status == "interrupted"
+    assert result.error_code == "scheduler_stopped"
+    assert runner.cancelled
+    assert not engine.healthy
+    assert not engine._tasks
+    assert engine.with_next_run(schedule).next_run_at is None
+
+
+async def test_close_cancels_active_scheduled_run(runtime, schedule):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    runner.block = True
+    pending = asyncio.create_task(engine._run_scheduled(schedule.id))
+    await asyncio.wait_for(runner.started.wait(), timeout=2)
+
+    await asyncio.wait_for(engine.close(), timeout=2)
+
+    assert pending.cancelled()
+    assert store.list_runs(schedule.tenant_id)[0].status == "interrupted"
+    assert runner.cancelled
+
+
+async def test_close_recovers_manual_task_cancelled_before_first_step(
+    runtime, schedule
+):
+    store, engine, runner = runtime
+    add_schedule(runtime, schedule)
+    accepted = engine.run_now(schedule.id)
+    await engine.close()
+    assert runner.calls == []
+    assert store.list_runs(schedule.tenant_id)[0].id == accepted.id
+    assert store.list_runs(schedule.tenant_id)[0].status == "interrupted"
+
+
+async def test_closed_engine_rejects_operations_and_callbacks_do_nothing(
+    runtime, schedule
+):
+    _, engine, runner = runtime
+    await engine.close()
+    await engine.close()
     with pytest.raises(RuntimeError, match="closed"):
-        engine.run_now(UUID(int=1))
+        engine.start()
+    with pytest.raises(RuntimeError, match="not running"):
+        engine.sync_schedule(schedule)
+    with pytest.raises(RuntimeError, match="not running"):
+        engine.run_now(schedule.id)
+    await engine._run_scheduled(schedule.id)
+    await engine._prune_history()
+    assert runner.calls == []
+
+
+async def test_unstarted_engine_closes_cleanly(runtime, tenant_id, schedule):
+    store, _, runner = runtime
+    engine = SchedulerEngine(store, runner, tenant_id, clock=lambda: datetime.now(UTC))
+    with pytest.raises(RuntimeError, match="not running"):
+        engine.sync_schedule(schedule)
+    assert not engine.healthy
+    await engine.close()

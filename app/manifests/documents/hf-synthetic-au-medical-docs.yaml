@@ -1,0 +1,31 @@
+# Synthetic Australian medical documents: the free 50-document sample, each as a clean and a scanned
+# PDF (100 files). Ground truth and pixel-precise field bounding boxes ship alongside
+# (ground_truth.jsonl, bboxes.jsonl), for scoring the Document worker downstream.
+# Synthetic, PHI-free; every page footer reads "SYNTHETIC TRAINING DOCUMENT - NOT FOR CLINICAL USE".
+id: hf-synthetic-au-medical-docs
+description: 100 synthetic medical PDFs (pathology reports and requests, prescriptions, referrals, clean and scanned)
+stream: documents
+mode: pull
+route: L7
+fetch: huggingface
+auth:
+  type: none
+  vault_path: null
+schedule:
+  class: F4  # on demand (CN-01 frequency class): the scheduler or an operator starts a pull
+formats: [pdf]
+phi: false
+owner: divij
+phase: dev  # a development source: refused in qa and production
+shadow: false  # enabled; true would store and receipt but publish nothing to raw_data
+raw_retention: forever
+contract:
+  baa: null  # public synthetic dataset: no PHI, no business associate
+  dpa: null
+license: CC BY-NC 4.0 - evaluation and non-commercial research only
+include: ["pdfs/*.pdf", "pdfs_scanned/*.pdf"]  # clean PDFs and their scanned copies (for OCR)
+max_file_bytes: 52428800
+huggingface:
+  repo_id: RootCauseAnalytics/synthetic-australian-medical-documents-sample
+  revision: 75d0072abf04f324303069bd2f6753c429fd9a52  # pinned for repeatable pulls
+  repo_type: dataset

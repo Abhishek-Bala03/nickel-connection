@@ -1,0 +1,8 @@
+[
+  {
+    "id": "sample-lab-reports",
+    "name": "Sample lab reports",
+    "connector_type": "documents",
+    "manifest": "http-lab-sample-reports"
+  }
+]

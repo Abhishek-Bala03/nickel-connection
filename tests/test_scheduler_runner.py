@@ -1,93 +1,176 @@
-"""Tests for connector routing and execution."""
-
-from datetime import UTC, datetime
+import json
 from uuid import uuid4
 
+import httpx
 import pytest
 
-from nickel_connection.scheduler.models import Schedule
-from nickel_connection.scheduler.runner import (
+from src.scheduler.models import Schedule
+from src.scheduler.registry import Connection, ConnectorRegistry
+from src.scheduler.runner import (
     ConnectorRunner,
     DemoConnector,
-    RunContext,
-    RunResult,
+    JobsConnector,
+    RetryableConnectorError,
 )
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
 
 
 @pytest.fixture
 def schedule():
     return Schedule(
         tenant_id=uuid4(),
-        name="Demo source",
-        connector_type="demo",
-        connection_id="demo-connection",
-        interval_seconds=30,
-        next_run_at=datetime(2026, 9, 23, 12, 0, tzinfo=UTC),
+        name="Documents",
+        connector_type="documents",
+        connection_id="docs",
+        interval_seconds=300,
     )
 
 
-class RecordingConnector:
-    def __init__(self):
-        self.contexts = []
-
-    def run(self, context: RunContext) -> RunResult:
-        self.contexts.append(context)
-        return RunResult(items_processed=3, message="Completed")
-
-
-class FailingConnector:
-    def run(self, context: RunContext) -> RunResult:
-        raise ConnectionError("Source unavailable")
-
-
-def test_pass_execution_context_to_selected_connector(schedule):
-    selected = RecordingConnector()
-    other = RecordingConnector()
-    runner = ConnectorRunner({"demo": selected, "other": other})
-    run_id = uuid4()
-
-    result = runner.run(schedule, run_id)
-
-    assert selected.contexts == [
-        RunContext(
-            run_id=run_id,
-            tenant_id=schedule.tenant_id,
-            connection_id=schedule.connection_id,
-        )
-    ]
-    assert other.contexts == []
-    assert result == RunResult(items_processed=3, message="Completed")
+def registry():
+    return ConnectorRegistry(
+        [
+            Connection(
+                id="docs",
+                name="Documents",
+                connector_type="documents",
+                manifest="test-docs",
+            )
+        ]
+    )
 
 
-def test_unknown_connector_is_rejected(schedule):
-    runner = ConnectorRunner({})
-
-    with pytest.raises(ValueError, match="Unknown connector type"):
-        runner.run(schedule, uuid4())
-
-
-def test_connector_failure_reaches_caller(schedule):
-    runner = ConnectorRunner({"demo": FailingConnector()})
-
-    with pytest.raises(ConnectionError, match="Source unavailable"):
-        runner.run(schedule, uuid4())
-
-
-def test_demo_is_clearly_identified_as_simulation(schedule):
+@pytest.mark.anyio
+async def test_demo_and_unknown(schedule):
     runner = ConnectorRunner({"demo": DemoConnector()})
-
-    result = runner.run(schedule, uuid4())
-
-    assert result.items_processed == 0
-    assert "Simulation" in result.message
-    assert "no source data was fetched" in result.message
+    with pytest.raises(ValueError):
+        await runner.run(schedule, uuid4())
+    schedule.connector_type = "demo"
+    assert (await runner.run(schedule, uuid4())).items_processed == 0
 
 
-def test_pass_configured_timeout_to_connector(schedule):
-    schedule.timeout_seconds = 15
-    connector = RecordingConnector()
-    runner = ConnectorRunner({"demo": connector})
+@pytest.mark.anyio
+async def test_jobs_poll_and_retry_same_key(schedule, monkeypatch):
+    schedule.max_retries = 1
+    calls = []
+    job_id = uuid4()
 
-    runner.run(schedule, uuid4())
+    async def no_wait(seconds):
+        return None
 
-    assert connector.contexts[0].timeout_seconds == 15
+    monkeypatch.setattr("src.scheduler.runner.asyncio.sleep", no_wait)
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503)
+        if request.method == "POST":
+            assert json.loads(request.content) == {"manifest": "test-docs"}
+            return httpx.Response(202, json={"job_id": str(job_id)})
+        return httpx.Response(
+            200,
+            json={
+                "status": "running" if len(calls) == 3 else "succeeded",
+                "counts": {"published": 3},
+            },
+        )
+
+    run_id = uuid4()
+    async with httpx.AsyncClient(
+        base_url="https://connection.test", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await JobsConnector(client, registry()).run(schedule, run_id)
+    assert result.items_processed == 3
+    assert (
+        calls[0].headers["Idempotency-Key"]
+        == calls[1].headers["Idempotency-Key"]
+        == str(run_id)
+    )
+    assert calls[-1].url.path == f"/jobs/{job_id}"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": "failed"},
+        {"status": "unknown"},
+        {"status": "succeeded", "counts": {"published": -1}},
+        {"status": "succeeded", "counts": {"published": True}},
+    ],
+)
+async def test_invalid_and_failed_jobs(schedule, result):
+    def handler(request):
+        return httpx.Response(
+            200, json={"job_id": str(uuid4())} if request.method == "POST" else result
+        )
+
+    async with httpx.AsyncClient(
+        base_url="https://connection.test", transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises((ValueError, RuntimeError)):
+            await JobsConnector(client, registry()).run(schedule, uuid4())
+
+
+@pytest.mark.anyio
+async def test_transport_exhaustion_and_nonretryable(schedule):
+    def failed(request):
+        raise httpx.ConnectError("private details", request=request)
+
+    async with httpx.AsyncClient(
+        base_url="https://connection.test", transport=httpx.MockTransport(failed)
+    ) as client:
+        with pytest.raises(RetryableConnectorError, match="unavailable"):
+            await JobsConnector(client, registry()).run(schedule, uuid4())
+    async with httpx.AsyncClient(
+        base_url="https://connection.test",
+        transport=httpx.MockTransport(lambda r: httpx.Response(401)),
+    ) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await JobsConnector(client, registry()).run(schedule, uuid4())
+
+
+@pytest.mark.anyio
+async def test_deadline_includes_request(schedule):
+    import asyncio
+
+    schedule.timeout_seconds = 1
+
+    async def hung(request):
+        await asyncio.Event().wait()
+
+    async with httpx.AsyncClient(
+        base_url="https://connection.test", transport=httpx.MockTransport(hung)
+    ) as client:
+        with pytest.raises(TimeoutError):
+            await JobsConnector(client, registry()).run(schedule, uuid4())
+
+
+def test_registry_rejects_invalid_connections(schedule):
+    with pytest.raises(ValueError, match="Duplicate"):
+        ConnectorRegistry(registry().connections * 2)
+    with pytest.raises(ValueError, match="Unregistered"):
+        ConnectorRegistry([Connection(id="x", name="x", connector_type="unknown")])
+    with pytest.raises(ValueError, match="manifest"):
+        ConnectorRegistry([Connection(id="x", name="x", connector_type="documents")])
+    schedule.connection_id = "missing"
+    with pytest.raises(ValueError, match="available"):
+        registry().validate(schedule)
+    schedule.connection_id = "docs"
+    schedule.interval_seconds = 1
+    with pytest.raises(ValueError, match="Minimum"):
+        registry().validate(schedule)
+    cron = schedule.model_copy(
+        update={
+            "trigger_type": "cron",
+            "interval_seconds": None,
+            "cron_expression": "* * * * *",
+        }
+    )
+    with pytest.raises(ValueError, match="daily"):
+        registry().validate(cron)
+    cron.cron_expression = "30 8 * * *"
+    assert registry().validate(cron).id == "docs"

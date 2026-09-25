@@ -1,0 +1,61 @@
+# Add to compose.yaml: docker compose -f compose.yaml -f compose.scheduler.yaml up --build
+# APScheduler 3.x: exactly one scheduler replica and one Uvicorn worker.
+services:
+  scheduler:
+    build: .
+    image: nickel-connection:dev
+    command: [uvicorn, src.scheduler.api:create_app, --factory, --host, 0.0.0.0, --port, "8000", --workers, "1", --no-server-header]
+    environment:
+      NICKEL_ENV: ${NICKEL_ENV:-production}
+      NICKEL_TENANT_ID: ${NICKEL_TENANT_ID:?Set the deployment tenant}
+      NICKEL_SERVICE_TOKEN: ${NICKEL_SERVICE_TOKEN:?Set the shared service token}
+      NICKEL_SCHEDULER_DB: /data/scheduler.sqlite
+      NICKEL_SCHEDULER_CONNECTIONS: /config/connections.json
+      NICKEL_CONNECTION_URL: http://nickel-connection:8000
+    volumes:
+      - scheduler-data:/data
+      - ${SCHEDULER_CONNECTIONS_FILE:-./scheduler-connections.example.json}:/config/connections.json:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    deploy:
+      replicas: 1
+    depends_on:
+      nickel-connection:
+        condition: service_healthy
+
+  scheduler-ui:
+    build: ${SCHEDULER_UI_CONTEXT:-../nickel-connections-ui}
+    ports: ["127.0.0.1:${SCHEDULER_UI_PORT:-8080}:8080"]
+    environment:
+      SCHEDULER_UPSTREAM: http://scheduler:8000
+      AUTH_UPSTREAM: http://scheduler-auth:4180
+      PUBLIC_ORIGIN: ${SCHEDULER_PUBLIC_ORIGIN:?Set the public UI origin without trailing slash}
+      NICKEL_SERVICE_TOKEN: ${NICKEL_SERVICE_TOKEN:?Set the shared service token}
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      scheduler:
+        condition: service_healthy
+      scheduler-auth:
+        condition: service_started
+
+  scheduler-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.1@sha256:39f08531587045a5443db43299bf8495696c99ed8d0e1fdcbe60534f7c02ce14
+    command: [--http-address=0.0.0.0:4180, --upstream=static://202, --provider=keycloak-oidc, --set-xauthrequest=true, --reverse-proxy=true, --session-cookie-minimal=true, --cookie-refresh=0, --cookie-expire=1h, --cookie-samesite=lax, --code-challenge-method=S256, --email-domain=*]
+    environment:
+      OAUTH2_PROXY_OIDC_ISSUER_URL: ${KEYCLOAK_ISSUER_URL:?Set the Keycloak realm issuer URL}
+      OAUTH2_PROXY_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:?Set the confidential client ID}
+      OAUTH2_PROXY_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:?Set the client secret}
+      OAUTH2_PROXY_COOKIE_SECRET: ${SCHEDULER_COOKIE_SECRET:?Set a random 32-byte base64 cookie secret}
+      OAUTH2_PROXY_REDIRECT_URL: ${SCHEDULER_PUBLIC_ORIGIN:?Set the public origin}/oauth2/callback
+      OAUTH2_PROXY_ALLOWED_GROUPS: ${SCHEDULER_ADMIN_GROUP:?Set the Keycloak scheduler admin group}
+      OAUTH2_PROXY_COOKIE_SECURE: ${SCHEDULER_COOKIE_SECURE:-true}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  scheduler-data:

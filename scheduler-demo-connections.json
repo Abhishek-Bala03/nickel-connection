@@ -1,0 +1,7 @@
+[
+  {
+    "id": "demo-connection",
+    "name": "Demo connection",
+    "connector_type": "demo"
+  }
+]
