@@ -24,11 +24,18 @@ class ConnectorCreate(ConnectorEdit):
     source: Literal["nango", "nickel_internal"] = "nango"
     provider: str = Field(pattern=r"^[a-z0-9-]{2,40}$")
     nango_connection_id: str = Field(min_length=1, max_length=100, pattern=_ID)
+    nango_integration: str | None = Field(
+        default=None, min_length=1, max_length=100, pattern=_ID
+    )
     patient_id: str | None = Field(default=None, max_length=64, pattern=_ID)
 
 
 class ConnectorUpdate(ConnectorEdit):
     version: int = Field(ge=1, strict=True)
+    provider: str | None = Field(
+        default=None,
+        pattern=r"^[a-z0-9-]{2,40}$",
+    )
 
 
 class ConnectorResponse(BaseModel):
@@ -55,6 +62,7 @@ class ConnectorResponse(BaseModel):
 
 
 class ProviderInfo(BaseModel):
+    nango_integration: str | None = None
     id: str
     name: str
     streams: list[str]
@@ -75,3 +83,9 @@ class PullResponse(BaseModel):
     records: int
     fetched_at: str
     viewable: bool
+
+
+class ConnectSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    integration: str = Field(min_length=1, max_length=100, pattern=_ID)
+    end_user_id: str = Field(min_length=1, max_length=128)

@@ -1,0 +1,34 @@
+# Remote Nango; use with compose.yaml, not compose.nango.yaml.
+# docker compose -f compose.yaml -f compose.nango.remote.yaml up -d --build nickel-connection scheduler
+services:
+  nickel-connection:
+    environment:
+      NICKEL_NANGO_URL: ${NICKEL_NANGO_URL:?set the remote Nango API URL in .env}
+      NICKEL_NANGO_SECRET_KEY: ${NICKEL_NANGO_SECRET_KEY:?set the remote environment API key in .env}
+      # Remote integrations route to their own providers, never the local simulator.
+      NICKEL_NANGO_BASE_URL_OVERRIDES: ""
+
+  # APScheduler 3.x: exactly one replica and one Uvicorn worker (docs/scheduler.md).
+  scheduler:
+    image: nickel-connection:dev
+    command: [uvicorn, src.scheduler.api:create_app, --factory, --host, 0.0.0.0, --port, "8000", --workers, "1", --no-server-header]
+    environment:
+      NICKEL_ENV: development
+      NICKEL_TENANT_ID: ${NICKEL_TENANT_ID:?set NICKEL_TENANT_ID in .env}
+      NICKEL_SERVICE_TOKEN: ${NICKEL_SERVICE_TOKEN:?set NICKEL_SERVICE_TOKEN in .env}
+      NICKEL_SCHEDULER_DB: /data/scheduler.sqlite
+      NICKEL_CONNECTION_URL: http://nickel-connection:8000
+    ports:
+      - "127.0.0.1:${SCHEDULER_PORT:-8001}:8000"
+    volumes:
+      - scheduler-data:/data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      nickel-connection:
+        condition: service_healthy
+
+volumes:
+  scheduler-data:

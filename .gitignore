@@ -16,3 +16,6 @@ build/
 
 # secrets never live in the repo
 .env
+
+# Local environment backups may contain credentials.
+.env.before-*

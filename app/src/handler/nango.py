@@ -19,6 +19,7 @@ from uuid import UUID
 
 from src.config import ServiceSettings
 from src.connectors import nango
+from src.connectors.nango.resources import fetch_resource
 from src.db.connectors import Connector, ConnectorConflictError, ConnectorStore, Pull
 from src.db.file_store import open_file_store
 from src.db.jobs import Job
@@ -30,7 +31,9 @@ from src.error import (
     NotFoundError,
     UnavailableError,
 )
+from src.handler import plugin_catalog
 from src.handler.documents import ingest_bridge, require_tenant
+from src.models.plugins import PluginResource
 from src.utility.ids import uuid7
 
 PULL_KIND = "nango.pull"
@@ -58,8 +61,10 @@ def _conflict(exc: ConnectorConflictError) -> ConflictError:
     return ConflictError(str(exc))
 
 
-def _streams(provider_key: str, streams: list[str]) -> list[str]:
-    known = nango.provider(provider_key).streams
+def _streams(
+    settings: ServiceSettings, provider_key: str, streams: list[str]
+) -> list[str]:
+    known = plugin_catalog.provider(settings, provider_key).streams
     unknown = [s for s in streams if s not in known]
     if unknown:
         raise BadRequestError(f"{provider_key} has no stream {unknown[0]!r}")
@@ -92,19 +97,25 @@ def create_connector(
     streams: list[str],
     enabled: bool,
     changed_by: str | None,
+    nango_integration: str | None = None,
 ) -> Connector:
     tenant = str(require_tenant(settings))
     if source != "nango":
         raise BadRequestError("Nickel internal sources are not available yet")
-    spec = nango.provider(provider_key)
-    streams = _streams(provider_key, streams)
+    spec = plugin_catalog.provider(settings, provider_key)
+    integration = nango_integration or spec.integration
+    plugin_catalog.check_integration(settings, provider_key, integration)
+    streams = _streams(settings, provider_key, streams)
     nango_client = client(settings)
     try:
-        if provider_key in settings.nango_base_url_overrides:
+        if (
+            nango_integration is None
+            and provider_key in settings.nango_base_url_overrides
+        ):
             nango_client.ensure_simulated_connection(
                 spec.integration, nango_connection_id
             )
-        elif not nango_client.has_connection(spec.integration, nango_connection_id):
+        elif not nango_client.has_connection(integration, nango_connection_id):
             raise BadRequestError(
                 "No such Nango connection: connect the patient's account in Nango first"
             )
@@ -118,7 +129,7 @@ def create_connector(
         description=description,
         source=source,
         provider=provider_key,
-        nango_integration=spec.integration,
+        nango_integration=integration,
         nango_connection_id=nango_connection_id,
         patient_id=patient_id,
         streams=streams,
@@ -145,19 +156,42 @@ def update_connector(
     enabled: bool,
     version: int,
     changed_by: str | None,
+    provider_key: str | None = None,
 ) -> Connector:
     current = get_connector(settings, connector_id)
+    selected_provider = provider_key or current.provider
+    plugin_catalog.check_integration(
+        settings, selected_provider, current.nango_integration
+    )
+    selected_streams = _streams(settings, selected_provider, streams)
+
+    if selected_provider != current.provider:
+        remote = client(settings)
+        try:
+            if not remote.has_connection(
+                current.nango_integration,
+                current.nango_connection_id,
+            ):
+                raise BadRequestError("The saved connection no longer exists in Nango")
+        finally:
+            remote.close()
+
     edited = replace(
         current,
         name=name,
         description=description,
-        streams=_streams(current.provider, streams),
+        provider=selected_provider,
+        streams=selected_streams,
         enabled=enabled,
         updated_at=_now(),
         changed_by=changed_by,
     )
+
     try:
-        return store(settings).update(edited, expected_version=version)
+        return store(settings).update(
+            edited,
+            expected_version=version,
+        )
     except ConnectorConflictError as exc:
         raise _conflict(exc) from None
 
@@ -165,16 +199,20 @@ def update_connector(
 def check_connector(settings: ServiceSettings, connector_id: str) -> dict:
     """One call through Nango for the connector's first stream: does the chain answer?"""
     connector = get_connector(settings, connector_id)
-    spec = nango.provider(connector.provider)
+    spec = plugin_catalog.provider(settings, connector.provider)
     stream = connector.streams[0]
     nango_client = client(settings)
     started = time.monotonic()
     try:
-        data = nango_client.proxy_get(
-            connector.nango_integration,
-            connector.nango_connection_id,
-            spec.streams[stream],
-            base_url_override=settings.nango_base_url_overrides.get(connector.provider),
+        data = (
+            resource_fetcher(settings, connector, nango_client)(stream)
+            if connector.provider not in nango.PROVIDERS
+            else nango_client.proxy_get(
+                connector.nango_integration,
+                connector.nango_connection_id,
+                spec.streams[stream],
+                base_url_override=base_url_override(settings, connector),
+            )
         )
         return {
             "ok": True,
@@ -226,10 +264,14 @@ def run_pull(settings: ServiceSettings, job: Job) -> dict[str, int]:
                 streams=connector.streams,
                 patient_id=connector.patient_id,
                 trace_id=UUID(job.job_id).hex,
-                base_url_override=settings.nango_base_url_overrides.get(
-                    connector.provider
-                ),
+                base_url_override=base_url_override(settings, connector),
                 on_stream=record,
+                spec=plugin_catalog.provider(settings, connector.provider),
+                fetch_stream=(
+                    resource_fetcher(settings, connector, nango_client)
+                    if connector.provider not in nango.PROVIDERS
+                    else None
+                ),
             )
     finally:
         nango_client.close()
@@ -248,3 +290,32 @@ def read_payload(settings: ServiceSettings, job_id: str, stream: str) -> bytes:
             f"the payload is {pull.bytes} bytes; the viewer shows up to {MAX_VIEW_BYTES}"
         )
     return open_file_store(settings).get(pull.payload_ref, max_bytes=MAX_VIEW_BYTES)
+
+
+def base_url_override(settings: ServiceSettings, connector: Connector) -> str | None:
+    # Local simulator routing applies only to the legacy local demo integration.
+    if (
+        connector.nango_integration
+        != plugin_catalog.provider(settings, connector.provider).integration
+    ):
+        return None
+    return settings.nango_base_url_overrides.get(connector.provider)
+
+
+def resource_fetcher(settings, connector, remote):
+    definition = plugin_catalog.plugin(settings, connector.provider)
+    resources = {
+        r["name"]: PluginResource.model_validate(r) for r in definition["resources"]
+    }
+
+    def fetch(stream):
+        return fetch_resource(
+            remote,
+            connector.nango_integration,
+            connector.nango_connection_id,
+            resources[stream],
+            max_bytes=settings.max_file_bytes,
+            base_url=definition.get("base_url"),
+        )
+
+    return fetch

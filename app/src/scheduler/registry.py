@@ -28,7 +28,7 @@ class ConnectorRegistry:
                 id="documents", name="Document jobs API", minimum_interval_seconds=300
             ),
             ConnectorInfo(
-                id="nango", name="Nango — wearables", minimum_interval_seconds=60
+                id="nango", name="Nango — API sources", minimum_interval_seconds=60
             ),
         ]
         if demo:

@@ -171,16 +171,18 @@ class ConnectorStore:
             ) from exc
 
     def update(self, connector: Connector, *, expected_version: int) -> Connector:
-        """Name, description, streams and enabled only; the source and the connection are fixed."""
+        """Update editable fields while preserving the Nango connection reference."""
         try:
             with self._db() as db:
                 changed = db.execute(
-                    "UPDATE connectors SET name = ?, description = ?, streams = ?, enabled = ?, "
+                    "UPDATE connectors SET name = ?, description = ?, "
+                    "provider = ?, streams = ?, enabled = ?, "
                     "version = version + 1, updated_at = ?, changed_by = ? "
                     "WHERE tenant_id = ? AND id = ? AND version = ?",
                     (
                         connector.name,
                         connector.description,
+                        connector.provider,
                         json.dumps(connector.streams),
                         int(connector.enabled),
                         connector.updated_at,
@@ -192,12 +194,14 @@ class ConnectorStore:
                 ).rowcount
         except sqlite3.IntegrityError as exc:
             raise ConnectorConflictError(
-                "A connector with this name exists already"
+                "The change conflicts with an existing connector"
             ) from exc
+
         if not changed:
             raise ConnectorConflictError(
                 "The connector changed since it was loaded. Reload and try again."
             )
+
         return self.get(connector.tenant_id, connector.id)
 
     def record_pull(self, pull: Pull) -> None:

@@ -2,19 +2,21 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Path, Response
+from fastapi import APIRouter, Header, Path, Query, Response
 
 from src.connectors import nango as catalog
-from src.handler import nango
+from src.handler import nango, plugin_catalog, plugins
 from src.models.connectors import (
     ConnectorCreate,
     ConnectorResponse,
     ConnectorUpdate,
+    ConnectSessionRequest,
     NangoPullRequest,
     ProviderInfo,
     PullResponse,
 )
 from src.models.jobs import JobAccepted
+from src.models.plugins import PluginCreate, PluginProvision
 from src.services.dependencies import Jobs, Settings
 from src.services.jobs_service import IdempotencyKey, JobId, _accepted
 
@@ -29,6 +31,24 @@ Actor = Annotated[
 ]
 
 
+@connectors_router.get("/plugins")
+def list_plugins(settings: Settings) -> list[dict]:
+    return plugins.list_plugins(settings)
+
+
+@connectors_router.post("/plugins", status_code=201)
+def create_plugin(body: PluginCreate, settings: Settings, actor: Actor = None) -> dict:
+    return plugins.create_plugin(settings, body, changed_by=actor)
+
+
+@connectors_router.post("/plugins/{plugin_id}/provision")
+def provision_plugin(
+    plugin_id: str, body: PluginProvision, settings: Settings, response: Response
+) -> dict:
+    response.headers["Cache-Control"] = "no-store"
+    return plugins.provision_plugin(settings, plugin_id, body)
+
+
 @connectors_router.get("/connectors/catalog")
 def provider_catalog(settings: Settings) -> list[ProviderInfo]:
     """What can be connected, and the streams each provider offers."""
@@ -40,6 +60,16 @@ def provider_catalog(settings: Settings) -> list[ProviderInfo]:
             simulated=key in settings.nango_base_url_overrides,
         )
         for key, spec in catalog.PROVIDERS.items()
+    ] + [
+        ProviderInfo(
+            id=p["id"],
+            name=p["name"],
+            streams=[r["name"] for r in p["resources"]],
+            simulated=False,
+            nango_integration=p["nango_integration"],
+        )
+        for p in plugin_catalog.definitions(settings)
+        if p["status"] == "ready"
     ]
 
 
@@ -59,6 +89,7 @@ def create_connector(
             name=body.name,
             description=body.description,
             source=body.source,
+            nango_integration=body.nango_integration,
             provider_key=body.provider,
             nango_connection_id=body.nango_connection_id,
             patient_id=body.patient_id,
@@ -67,6 +98,51 @@ def create_connector(
             changed_by=actor,
         )
     )
+
+
+@connectors_router.get("/nango/providers")
+def nango_providers(settings: Settings) -> list[dict]:
+    remote = nango.client(settings)
+    try:
+        return remote.providers()
+    finally:
+        remote.close()
+
+
+@connectors_router.get("/nango/integrations")
+def nango_integrations(settings: Settings) -> list[dict]:
+    remote = nango.client(settings)
+    try:
+        return remote.integrations()
+    finally:
+        remote.close()
+
+
+@connectors_router.get("/nango/connections")
+def nango_connections(
+    settings: Settings,
+    integration: Annotated[
+        str, Query(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
+    ],
+    page: Annotated[int, Query(ge=0, le=10000)] = 0,
+) -> dict:
+    remote = nango.client(settings)
+    try:
+        return remote.connections(integration, page)
+    finally:
+        remote.close()
+
+
+@connectors_router.post("/nango/connect-session", status_code=201)
+def nango_connect_session(
+    body: ConnectSessionRequest, settings: Settings, response: Response
+) -> dict:
+    remote = nango.client(settings)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return remote.connect_session(body.integration, body.end_user_id)
+    finally:
+        remote.close()
 
 
 @connectors_router.get("/connectors/{connector_id}")
@@ -81,13 +157,14 @@ def update_connector(
     settings: Settings,
     actor: Actor = None,
 ) -> ConnectorResponse:
-    """Name, description, streams and enabled; 409 when the version is not the current one."""
+    """Edit provider and display fields; preserve the Nango reference and check version."""
     return ConnectorResponse.of(
         nango.update_connector(
             settings,
             connector_id,
             name=body.name,
             description=body.description,
+            provider_key=body.provider,
             streams=body.streams,
             enabled=body.enabled,
             version=body.version,
