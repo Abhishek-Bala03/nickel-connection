@@ -1,0 +1,35 @@
+schema_version: "1.0"
+adapter:
+  id: documents
+  version: "0.1.0"
+id: public-documents
+stream: documents
+mode: pull
+route: L7
+auth:
+  type: none
+  vault_path: null
+schedule:
+  class: F4
+  interval: null
+  overlap: 0
+  backfill: 0
+# Contract example only; not loaded by the document runner.
+endpoints:
+  - https://example.org/reports/
+rate_limit:
+  requests: 1
+  window_seconds: 1
+formats:
+  schema_id: null
+  validate: false
+expectations:
+  freshness_slo: 86400
+contract:
+  baa: null
+  dpa: null
+phi: false
+owner: connection-team
+phase: dev
+shadow: true
+raw_retention: 30d

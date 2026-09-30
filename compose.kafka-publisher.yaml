@@ -1,0 +1,5 @@
+# Add after compose.yaml and compose.nango.yaml. Start compose.kafka.yaml first.
+services:
+  nickel-connection:
+    environment:
+      NICKEL_KAFKA_BOOTSTRAP_SERVERS: kafka:19092

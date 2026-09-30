@@ -1,0 +1,331 @@
+{
+  "$defs": {
+    "Quality": {
+      "properties": {
+        "flags": {
+          "description": "What a layer flagged about the message; the connection layer flags nothing.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Flags",
+          "type": "array"
+        }
+      },
+      "title": "Quality",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "What this service builds and publishes (module docstring): strict. An unknown or misspelled\nfield is an error, the v0.2 name ``payload_sha256`` is unknown here, and the version is the\ncurrent one only.",
+  "properties": {
+    "envelope_version": {
+      "const": "0.3",
+      "default": "0.3",
+      "description": "The version this service writes: always the current one.",
+      "title": "Envelope Version",
+      "type": "string"
+    },
+    "ingest_id": {
+      "description": "UUIDv7 minted when the payload was received; the receipt's primary key.",
+      "format": "uuid",
+      "title": "Ingest Id",
+      "type": "string"
+    },
+    "tenant_id": {
+      "description": "Owning tenant. Resolved by the platform, never read from the payload.",
+      "format": "uuid",
+      "title": "Tenant Id",
+      "type": "string"
+    },
+    "member_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The Nickel member the payload belongs to, when its producer knows it (the mobile edge knows its signed-in member). Null otherwise: identity resolution (Layer 3) decides. Always null from the document connector.",
+      "title": "Member Id"
+    },
+    "source": {
+      "description": "Manifest id of the source, e.g. 'hf-medical-lab-reports'.",
+      "title": "Source",
+      "type": "string"
+    },
+    "fetch": {
+      "description": "How the payload was fetched: kaggle, huggingface, http, local, nango, ...",
+      "title": "Fetch",
+      "type": "string"
+    },
+    "route": {
+      "description": "The lab route (L1-L9) the fidelity ranking reads; from the manifest. Specialty-lab PDFs are L7.",
+      "pattern": "^L[1-9]$",
+      "title": "Route",
+      "type": "string"
+    },
+    "mode": {
+      "description": "The ingestion mode: pull, stream, listener, upload or mobile.",
+      "enum": [
+        "pull",
+        "stream",
+        "listener",
+        "upload",
+        "mobile"
+      ],
+      "title": "Mode",
+      "type": "string"
+    },
+    "connector": {
+      "title": "Connector",
+      "type": "string"
+    },
+    "connector_version": {
+      "title": "Connector Version",
+      "type": "string"
+    },
+    "connection_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Nango connection id; null for public datasets.",
+      "title": "Connection Id"
+    },
+    "source_patient_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Patient id as the source knows it (PHI). Null when the source does not say.",
+      "title": "Source Patient Id"
+    },
+    "device_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The device a reading came from (a wearable, a CGM, a phone), as its source names it. Null for anything that is not device data: always, from the document connector.",
+      "title": "Device Id"
+    },
+    "message_id": {
+      "description": "Stable id of the item at the source; with source, the downstream dedup key.",
+      "title": "Message Id",
+      "type": "string"
+    },
+    "idempotency_key": {
+      "description": "sha256 over tenant, source, message id and payload hash (D-00); a retry of the same receipt keeps it.",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "trace_id": {
+      "description": "The run that published this message: a job's id, or a fresh id for a command-line run.",
+      "pattern": "^[0-9a-f]{32}$",
+      "title": "Trace Id",
+      "type": "string"
+    },
+    "attempt": {
+      "description": "The receipt's publish-attempt count, this one included.",
+      "minimum": 1,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "content_type": {
+      "title": "Content Type",
+      "type": "string"
+    },
+    "fhir_release": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The FHIR release of a FHIR payload (R4, R4B, R5, ...), from its source. Null for anything that is not FHIR: always, from the document connector (PDFs).",
+      "title": "Fhir Release"
+    },
+    "received_at": {
+      "description": "When the receipt was first written; a retry keeps it.",
+      "format": "date-time",
+      "title": "Received At",
+      "type": "string"
+    },
+    "event_time": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "When the source says the item was produced.",
+      "title": "Event Time"
+    },
+    "retention_class": {
+      "description": "File Store object class; decides how long the original is kept.",
+      "title": "Retention Class",
+      "type": "string"
+    },
+    "schema_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Registered schema of an inline payload; null for a file by pointer.",
+      "title": "Schema Id"
+    },
+    "consent_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "The consent the payload came under; null for public datasets.",
+      "title": "Consent Ref"
+    },
+    "quality": {
+      "$ref": "#/$defs/Quality"
+    },
+    "payload_hash": {
+      "description": "sha256 of the payload's bytes.",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Payload Hash",
+      "type": "string"
+    },
+    "payload_bytes": {
+      "minimum": 1,
+      "title": "Payload Bytes",
+      "type": "integer"
+    },
+    "payload_ref": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "File Store object key when the payload goes by pointer.",
+      "title": "Payload Ref"
+    },
+    "payload": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Inline JSON payload for small messages.",
+      "title": "Payload"
+    },
+    "source_meta": {
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "description": "Where exactly the item came from: dataset, path, licence, URL.",
+      "title": "Source Meta",
+      "type": "object"
+    }
+  },
+  "required": [
+    "attempt",
+    "connector",
+    "connector_version",
+    "content_type",
+    "envelope_version",
+    "fetch",
+    "idempotency_key",
+    "ingest_id",
+    "message_id",
+    "mode",
+    "payload_bytes",
+    "payload_hash",
+    "received_at",
+    "retention_class",
+    "route",
+    "source",
+    "tenant_id",
+    "trace_id"
+  ],
+  "title": "Nickel raw data envelope v0.3",
+  "type": "object",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:nickel:schemas:raw-data-envelope:0.3",
+  "oneOf": [
+    {
+      "required": [
+        "payload_ref"
+      ],
+      "properties": {
+        "payload_ref": {
+          "type": "string"
+        },
+        "payload": {
+          "type": "null"
+        }
+      }
+    },
+    {
+      "required": [
+        "payload"
+      ],
+      "properties": {
+        "payload": {
+          "type": "object"
+        },
+        "payload_ref": {
+          "type": "null"
+        }
+      }
+    }
+  ]
+}

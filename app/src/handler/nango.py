@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from src.config import ServiceSettings
 from src.connectors import nango
-from src.connectors.nango.resources import fetch_resource
 from src.db.connectors import Connector, ConnectorConflictError, ConnectorStore, Pull
 from src.db.file_store import open_file_store
 from src.db.jobs import Job
 from src.db.layout import DataLayout
+from src.db.outbox import PublishError
+from src.db.receipts import ReceiptStatus
+from src.handler.ingest import Outcome
+from src.models.envelope import Envelope
+from pydantic import ValidationError
 from src.error import (
     BadRequestError,
     ConflictError,
@@ -33,7 +37,6 @@ from src.error import (
 )
 from src.handler import plugin_catalog
 from src.handler.documents import ingest_bridge, require_tenant
-from src.models.plugins import PluginResource
 from src.utility.ids import uuid7
 
 PULL_KIND = "nango.pull"
@@ -108,17 +111,16 @@ def create_connector(
     streams = _streams(settings, provider_key, streams)
     nango_client = client(settings)
     try:
-        if (
-            nango_integration is None
-            and provider_key in settings.nango_base_url_overrides
+        if not patient_id:
+            raise BadRequestError("Patient id is required")
+        resolved = nango_client.patient_connection(integration, patient_id, tenant)
+        if not resolved or (
+            nango_connection_id is not None and nango_connection_id != resolved
         ):
-            nango_client.ensure_simulated_connection(
-                spec.integration, nango_connection_id
-            )
-        elif not nango_client.has_connection(integration, nango_connection_id):
             raise BadRequestError(
-                "No such Nango connection: connect the patient's account in Nango first"
+                "Authorize this patient's account in Nango first; connection does not match"
             )
+        nango_connection_id = resolved
     finally:
         nango_client.close()
     stamp = _now()
@@ -156,31 +158,17 @@ def update_connector(
     enabled: bool,
     version: int,
     changed_by: str | None,
-    provider_key: str | None = None,
 ) -> Connector:
     current = get_connector(settings, connector_id)
-    selected_provider = provider_key or current.provider
     plugin_catalog.check_integration(
-        settings, selected_provider, current.nango_integration
+        settings, current.provider, current.nango_integration
     )
-    selected_streams = _streams(settings, selected_provider, streams)
-
-    if selected_provider != current.provider:
-        remote = client(settings)
-        try:
-            if not remote.has_connection(
-                current.nango_integration,
-                current.nango_connection_id,
-            ):
-                raise BadRequestError("The saved connection no longer exists in Nango")
-        finally:
-            remote.close()
+    selected_streams = _streams(settings, current.provider, streams)
 
     edited = replace(
         current,
         name=name,
         description=description,
-        provider=selected_provider,
         streams=selected_streams,
         enabled=enabled,
         updated_at=_now(),
@@ -200,19 +188,19 @@ def check_connector(settings: ServiceSettings, connector_id: str) -> dict:
     """One call through Nango for the connector's first stream: does the chain answer?"""
     connector = get_connector(settings, connector_id)
     spec = plugin_catalog.provider(settings, connector.provider)
+    plugin_catalog.check_integration(
+        settings, connector.provider, connector.nango_integration
+    )
     stream = connector.streams[0]
     nango_client = client(settings)
     started = time.monotonic()
     try:
-        data = (
-            resource_fetcher(settings, connector, nango_client)(stream)
-            if connector.provider not in nango.PROVIDERS
-            else nango_client.proxy_get(
-                connector.nango_integration,
-                connector.nango_connection_id,
-                spec.streams[stream],
-                base_url_override=base_url_override(settings, connector),
-            )
+        verify_binding(settings, connector, nango_client)
+        data = nango_client.proxy_get(
+            connector.nango_integration,
+            connector.nango_connection_id,
+            spec.streams[stream],
+            base_url_override=base_url_override(settings, connector),
         )
         return {
             "ok": True,
@@ -227,6 +215,33 @@ def check_connector(settings: ServiceSettings, connector_id: str) -> dict:
         nango_client.close()
 
 
+def _replay_pending(bridge, connector, trace_id):
+    """Retry original stored pages only after current patient binding has been verified."""
+    published = 0
+    for status in (ReceiptStatus.RECEIVED, ReceiptStatus.PUBLISH_FAILED):
+        for receipt in bridge.receipts.in_status(
+            status, {connector.nango_connection_id}, tenant_id=connector.tenant_id
+        ):
+            try:
+                envelope = Envelope.model_validate_json(receipt.envelope)
+            except ValidationError:
+                raise PublishError("Pending Nango envelope is invalid; receipt retained") from None
+            if (
+                envelope.tenant_id != UUID(connector.tenant_id)
+                or envelope.connection_id != connector.nango_connection_id
+                or envelope.source_patient_id != connector.patient_id
+                or envelope.source_meta.get("provider") != connector.provider
+                or envelope.source_meta.get("stream") not in connector.streams
+                or envelope.fetch != "nango"
+            ):
+                continue
+            result = bridge.republish(receipt, trace_id)
+            if result.outcome is Outcome.BAD_ENVELOPE:
+                raise PublishError("Pending Nango envelope cannot be replayed; receipt retained")
+            published += result.outcome is Outcome.PUBLISHED
+    return published
+
+
 def run_pull(settings: ServiceSettings, job: Job) -> dict[str, int]:
     """The ``nango.pull`` job: each of the connector's streams through Nango into the bridge, and
     each stream's stored object recorded against the job."""
@@ -235,6 +250,7 @@ def run_pull(settings: ServiceSettings, job: Job) -> dict[str, int]:
         raise BadRequestError("the connector is disabled")
     tenant = connector.tenant_id
     connectors = store(settings)
+    window_end = datetime.now(UTC)
 
     def record(result: nango.StreamResult) -> None:
         connectors.record_pull(
@@ -243,6 +259,7 @@ def run_pull(settings: ServiceSettings, job: Job) -> dict[str, int]:
                 tenant_id=tenant,
                 connector_id=connector.id,
                 stream=result.stream,
+                page=result.page,
                 outcome=str(result.result.outcome),
                 ingest_id=result.result.ingest_id,
                 payload_ref=result.result.payload_ref,
@@ -254,8 +271,10 @@ def run_pull(settings: ServiceSettings, job: Job) -> dict[str, int]:
 
     nango_client = client(settings)
     try:
+        verify_binding(settings, connector, nango_client)
         with ingest_bridge(settings) as bridge:
-            return nango.pull(
+            republished = _replay_pending(bridge, connector, UUID(job.job_id).hex)
+            counts = nango.pull(
                 nango_client,
                 bridge,
                 provider_key=connector.provider,
@@ -267,12 +286,27 @@ def run_pull(settings: ServiceSettings, job: Job) -> dict[str, int]:
                 base_url_override=base_url_override(settings, connector),
                 on_stream=record,
                 spec=plugin_catalog.provider(settings, connector.provider),
-                fetch_stream=(
-                    resource_fetcher(settings, connector, nango_client)
-                    if connector.provider not in nango.PROVIDERS
-                    else None
+                on_complete=lambda stream: connectors.advance(
+                    tenant, connector.id, stream, window_end.isoformat()
+                ),
+                fetch_stream=lambda stream: nango_client.proxy_pages(
+                    connector.nango_integration,
+                    connector.nango_connection_id,
+                    plugin_catalog.provider(settings, connector.provider).streams[
+                        stream
+                    ],
+                    base_url_override=base_url_override(settings, connector),
+                    query=window_query(
+                        connector.provider,
+                        stream,
+                        connectors.watermark(tenant, connector.id, stream),
+                        window_end,
+                    ),
                 ),
             )
+            if republished:
+                counts["republished"] = republished
+            return counts
     finally:
         nango_client.close()
 
@@ -281,8 +315,17 @@ def job_pulls(settings: ServiceSettings, job_id: str) -> list[Pull]:
     return store(settings).pulls(str(require_tenant(settings)), job_id)
 
 
-def read_payload(settings: ServiceSettings, job_id: str, stream: str) -> bytes:
-    pull = next((p for p in job_pulls(settings, job_id) if p.stream == stream), None)
+def read_payload(
+    settings: ServiceSettings, job_id: str, stream: str, page: int = 1
+) -> bytes:
+    pull = next(
+        (
+            p
+            for p in job_pulls(settings, job_id)
+            if p.stream == stream and p.page == page
+        ),
+        None,
+    )
     if pull is None or pull.payload_ref is None:
         raise NotFoundError(f"job {job_id} stored nothing for stream {stream!r}")
     if pull.bytes > MAX_VIEW_BYTES:
@@ -302,20 +345,35 @@ def base_url_override(settings: ServiceSettings, connector: Connector) -> str | 
     return settings.nango_base_url_overrides.get(connector.provider)
 
 
-def resource_fetcher(settings, connector, remote):
-    definition = plugin_catalog.plugin(settings, connector.provider)
-    resources = {
-        r["name"]: PluginResource.model_validate(r) for r in definition["resources"]
-    }
-
-    def fetch(stream):
-        return fetch_resource(
-            remote,
-            connector.nango_integration,
-            connector.nango_connection_id,
-            resources[stream],
-            max_bytes=settings.max_file_bytes,
-            base_url=definition.get("base_url"),
+def verify_binding(settings, connector, remote):
+    plugin_catalog.check_integration(
+        settings, connector.provider, connector.nango_integration
+    )
+    if (
+        not connector.patient_id
+        or remote.patient_connection(
+            connector.nango_integration, connector.patient_id, connector.tenant_id
+        )
+        != connector.nango_connection_id
+    ):
+        raise BadRequestError(
+            "Saved connection is not authorized for this patient; reconnect the account"
         )
 
-    return fetch
+
+def window_query(provider, stream, watermark, end):
+    # Bootstrap a bounded day, then overlap successful pulls. Daily Oura values can be revised.
+    start = datetime.fromisoformat(watermark) if watermark else end - timedelta(days=1)
+    if provider == "oura":
+        start -= timedelta(days=1)
+        return {
+            "start_date": start.date().isoformat(),
+            "end_date": end.date().isoformat(),
+        }
+    if provider == "dexcom" and stream == "egvs":
+        start -= timedelta(minutes=5)
+        return {
+            "startDate": start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "endDate": end.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+    return {}  # Device metadata and dataRange have no date-window parameters.

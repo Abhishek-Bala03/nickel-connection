@@ -25,6 +25,7 @@ from src.connectors.documents import (
 )
 from src.db.file_store import open_file_store
 from src.db.layout import DataLayout
+from src.db.kafka import KafkaPublisher
 from src.db.outbox import JsonlOutbox, PublishError
 from src.db.receipts import Receipt, ReceiptStatus, ReceiptStore
 from src.error import NotFoundError, UnavailableError
@@ -68,13 +69,19 @@ def ingest_bridge(settings: ServiceSettings) -> Iterator[IngestBridge]:
     tenant = require_tenant(settings)
     layout = DataLayout(settings.data_dir)
     with ReceiptStore(layout.receipts_db) as receipts:
-        yield IngestBridge(
-            tenant_id=tenant,
-            store=open_file_store(settings),
-            publisher=JsonlOutbox(layout.outbox),
-            receipts=receipts,
-            max_bytes=settings.max_file_bytes,
+        file_store = open_file_store(settings)
+        publisher = (
+            KafkaPublisher(settings.kafka_bootstrap_servers, file_store)
+            if settings.kafka_bootstrap_servers else JsonlOutbox(layout.outbox)
         )
+        try:
+            yield IngestBridge(
+                tenant_id=tenant, store=file_store, publisher=publisher,
+                receipts=receipts, max_bytes=settings.max_file_bytes,
+            )
+        finally:
+            if isinstance(publisher, KafkaPublisher):
+                publisher.close()
 
 
 def pull_documents(

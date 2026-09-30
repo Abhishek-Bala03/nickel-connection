@@ -12,8 +12,12 @@ through the handler; the Nango provider controls authentication and the destinat
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlsplit
 
 import httpx
@@ -99,6 +103,24 @@ def count_records(data: bytes) -> int:
     return 1
 
 
+def retry_delay(value: str | None, attempt: int) -> float:
+    delay = float(2**attempt)
+    if value:
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                delay = (
+                    parsedate_to_datetime(value) - datetime.now(UTC)
+                ).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                pass
+    # Do not retry earlier than the vendor requested; let the scheduler retry long waits.
+    if delay > 30:
+        raise UpstreamError("Vendor rate limit requires a later retry")
+    return max(0.0, delay)
+
+
 class NangoClient:
     """Nango's REST API with the environment's secret key. Errors are content-free: a status and
     what was being done, never a response body (it can echo a payload)."""
@@ -124,6 +146,22 @@ class NangoClient:
         except httpx.HTTPError as exc:
             raise UpstreamError(
                 f"Nango unreachable ({what}): {type(exc).__name__}"
+            ) from None
+
+    @contextmanager
+    def stream(self, method: str, path: str, **kwargs):
+        """Bounded rate-limit retries. Never retry a potentially mutating POST."""
+        try:
+            for attempt in range(3):
+                with self._http.stream(method, path, **kwargs) as response:
+                    if response.status_code != 429 or method != "GET" or attempt == 2:
+                        yield response
+                        return
+                    delay = retry_delay(response.headers.get("Retry-After"), attempt)
+                time.sleep(delay)
+        except httpx.HTTPError as exc:
+            raise UpstreamError(
+                f"Nango unreachable (proxy): {type(exc).__name__}"
             ) from None
 
     def _json(self, what: str, method: str, path: str, **kwargs) -> dict:
@@ -194,24 +232,68 @@ class NangoClient:
             if isinstance(item, dict) and isinstance(item.get("unique_key"), str)
         ]
 
-    def connections(self, integration: str, page: int = 0) -> dict:
+    def connections(
+        self, integration: str, patient_id: str, tenant_id: str, page: int = 0
+    ) -> dict:
         data = self._json(
-            "connections", "GET", "/connections", params={"page": page, "limit": 100}
+            "connections",
+            "GET",
+            "/connections",
+            params={
+                "page": page,
+                "limit": 100,
+                "endUserId": patient_id,
+                "endUserOrganizationId": tenant_id,
+            },
         ).get("connections")
         if not isinstance(data, list):
             raise UpstreamError("Nango returned an invalid connections response")
-        return {
-            "connections": [
-                {"id": item["connection_id"], "integration": integration}
-                for item in data
-                if isinstance(item, dict)
-                and item.get("provider_config_key") == integration
+        found = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            tags = item.get("tags") or {}
+            user = item.get("end_user") or {}
+            if not isinstance(tags, dict) or not isinstance(user, dict):
+                continue
+            organization = user.get("organization") or item.get("organization") or {}
+            if not isinstance(organization, dict):
+                continue
+            if (
+                item.get("provider_config_key") == integration
                 and isinstance(item.get("connection_id"), str)
-            ],
+                and tags.get("end_user_id", user.get("id")) == patient_id
+                and tags.get("organization_id", organization.get("id")) == tenant_id
+            ):
+                found.append({"id": item["connection_id"], "integration": integration})
+        return {
+            "connections": found,
             "next_page": page + 1 if len(data) == 100 else None,
         }
 
-    def connect_session(self, integration: str, end_user_id: str) -> dict:
+    def patient_connection(
+        self, integration: str, patient_id: str, tenant_id: str
+    ) -> str | None:
+        found = set()
+        for page in range(100):
+            result = self.connections(integration, patient_id, tenant_id, page)
+            found.update(c["id"] for c in result["connections"])
+            if len(found) > 1:
+                raise BadRequestError(
+                    "Multiple accounts are authorized for this patient; resolve the duplicate in Nango"
+                )
+            if result["next_page"] is None:
+                return next(iter(found), None)
+        raise UpstreamError("Patient connection discovery exceeded its page limit")
+
+    def connect_session(
+        self,
+        integration: str,
+        patient_id: str,
+        tenant_id: str,
+        *,
+        allow_http: bool = False,
+    ) -> dict:
         # Validate the integration before granting a narrowly scoped, short-lived session.
         if not any(item["id"] == integration for item in self.integrations()):
             raise BadRequestError("Select an existing Nango integration")
@@ -221,11 +303,19 @@ class NangoClient:
             "/connect/sessions",
             json={
                 "allowed_integrations": [integration],
-                "end_user": {"id": end_user_id},
+                "end_user": {"id": patient_id},
+                "organization": {"id": tenant_id},
             },
         ).get("data", {})
         link = data.get("connect_link") if isinstance(data, dict) else None
-        if not isinstance(link, str) or urlsplit(link).scheme not in {"http", "https"}:
+        parsed = urlsplit(link) if isinstance(link, str) else None
+        if (
+            not parsed
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.scheme not in ({"http", "https"} if allow_http else {"https"})
+        ):
             raise UpstreamError(
                 "Nango did not return a Connect link. Configure Connect UI on the Nango server."
             )
@@ -332,16 +422,52 @@ class NangoClient:
         path: str,
         *,
         base_url_override: str | None = None,
+        query: dict | None = None,
     ) -> bytes:
         headers = {"Connection-Id": connection_id, "Provider-Config-Key": integration}
         if base_url_override:
             headers["Base-Url-Override"] = base_url_override
-        response = self._call("proxy", "GET", f"/proxy{path}", headers=headers)
-        if response.status_code != 200:
-            raise UpstreamError(
-                f"the vendor call through Nango returned {response.status_code}"
+        with self.stream(
+            "GET", f"/proxy{path}", headers=headers, params=query
+        ) as response:
+            if response.status_code != 200:
+                raise UpstreamError(
+                    f"the vendor call through Nango returned {response.status_code}"
+                )
+            chunks = []
+            size = 0
+            for chunk in response.iter_bytes():
+                size += len(chunk)
+                if size > 20 * 1024 * 1024:
+                    raise UpstreamError("Vendor page exceeded the 20 MiB limit")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+    def proxy_pages(
+        self, integration, connection_id, path, *, query, base_url_override=None
+    ):
+        query = dict(query)
+        seen = set()
+        for _ in range(200):
+            data = self.proxy_get(
+                integration,
+                connection_id,
+                path,
+                query=query,
+                base_url_override=base_url_override,
             )
-        return response.content
+            yield data
+            body = json.loads(data)
+            token = body.get("next_token") if isinstance(body, dict) else None
+            if token is None or token == "":
+                return
+            if not isinstance(token, str) or token in seen:
+                raise UpstreamError(
+                    "The vendor repeated or returned an invalid page token"
+                )
+            seen.add(token)
+            query["next_token"] = token
+        raise UpstreamError("Vendor pagination exceeded its page limit")
 
 
 @dataclass(frozen=True)
@@ -350,6 +476,7 @@ class StreamResult:
     result: IngestResult
     bytes: int
     records: int
+    page: int = 1
 
 
 def pull(
@@ -365,7 +492,8 @@ def pull(
     base_url_override: str | None,
     on_stream: Callable[[StreamResult], None] = lambda _: None,
     spec: Provider | None = None,
-    fetch_stream: Callable[[str], bytes] | None = None,
+    fetch_stream: Callable[[str], bytes | Iterable[bytes]] | None = None,
+    on_complete: Callable[[str], None] = lambda _: None,
 ) -> dict[str, int]:
     """Fetch each stream and hand it to the bridge; the job's counts. A failed stream stops the
     run (UpstreamError): the streams before it are stored and receipted, and the next run repeats
@@ -401,20 +529,33 @@ def pull(
                 base_url_override=base_url_override,
             )
         )
-        result = bridge.ingest(
-            ctx,
-            RawItem(
-                message_id=f"{connection_id}/{stream}",
-                data=data,
-                source_meta={"provider": provider_key, "stream": stream},
-                source_patient_id=patient_id,
-            ),
-        )
-        records = count_records(data) if result.payload_ref else 0
+        pages = (data,) if isinstance(data, bytes) else data
+        accepted = True
+        for page, raw in enumerate(pages, 1):
+            result = bridge.ingest(
+                ctx,
+                RawItem(
+                    message_id=f"{connection_id}/{stream}",
+                    data=raw,
+                    source_meta={
+                        "provider": provider_key,
+                        "stream": stream,
+                        "page": page,
+                    },
+                    source_patient_id=patient_id,
+                ),
+            )
+            records = count_records(raw) if result.payload_ref else 0
+            counts["records"] += records
+            key = _COUNTED.get(result.outcome)
+            if key:
+                counts[key] += 1
+            accepted = accepted and result.outcome in {
+                Outcome.PUBLISHED,
+                Outcome.DUPLICATE,
+            }
+            on_stream(StreamResult(stream, result, len(raw), records, page))
         counts["streams"] += 1
-        counts["records"] += records
-        key = _COUNTED.get(result.outcome)
-        if key:
-            counts[key] += 1
-        on_stream(StreamResult(stream, result, len(data), records))
+        if accepted:
+            on_complete(stream)
     return counts

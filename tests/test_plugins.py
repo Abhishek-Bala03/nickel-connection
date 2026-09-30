@@ -1,7 +1,5 @@
 """Plugin drafts persist per tenant and never provision Nango connections."""
 
-from uuid import UUID
-
 import httpx
 import pytest
 
@@ -54,52 +52,14 @@ def draft(**changes):
     }
 
 
-def test_draft_creation_persistence_conflicts_and_tenants(service, providers):
+def test_plugin_writes_are_held_without_remote_calls(service, providers):
     with service() as api:
-        assert api.get("/plugins").json() == []
-        response = api.post(
-            "/plugins", json=draft(), headers={"X-Authenticated-User": "admin"}
-        )
-        assert response.status_code == 201
-        saved = response.json()
-        assert saved["status"] == "draft"
-        assert saved["nango_integration"] is None
-        assert saved["auth_mode"] == "TWO_STEP"
-        assert saved["changed_by"] == "admin"
-        assert api.post("/plugins", json=draft()).status_code == 409
-        assert api.post("/plugins", json=draft(id="another-id")).status_code == 409
-
-    with service() as api:
-        assert api.get("/plugins").json() == [saved]
-
-    with service(tenant_id=UUID("0192a3b4-0000-7000-8000-000000000002")) as api:
-        assert api.get("/plugins").json() == []
-        assert api.post("/plugins", json=draft()).status_code == 201
-
-
-def test_provider_discovery_returns_only_metadata(service, providers):
-    with service() as api:
-        response = api.get("/nango/providers")
-        assert response.status_code == 200
-        assert response.json() == [
-            {
-                "id": "epic",
-                "name": "Epic (FHIR)",
-                "auth_mode": "TWO_STEP",
-                "base_url": "https://${connectionConfig.host}/api",
-            }
-        ]
-
-
-def test_invalid_provider_and_reserved_id_are_not_saved(service, providers):
-    with service() as api:
+        assert api.post("/plugins", json=draft()).status_code == 400
         assert (
-            api.post("/plugins", json=draft(nango_provider="missing")).status_code
-            == 400
+            api.post("/plugins/epic-fhir-draft/provision", json={}).status_code == 400
         )
-        assert api.post("/plugins", json=draft(id="dexcom")).status_code == 400
         assert api.get("/plugins").json() == []
-    assert providers == [("GET", "/providers")]
+    assert providers == []
 
 
 @pytest.mark.parametrize(

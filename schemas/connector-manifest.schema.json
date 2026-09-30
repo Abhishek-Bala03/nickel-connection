@@ -1,0 +1,346 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{2,62}$"
+    },
+    "stream": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "mode": {
+      "enum": [
+        "pull",
+        "stream",
+        "listener",
+        "upload",
+        "mobile"
+      ]
+    },
+    "route": {
+      "type": "string",
+      "pattern": "^L[1-9]$"
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "vault_path": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "type",
+        "vault_path"
+      ]
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "class": {
+          "enum": [
+            "F1",
+            "F2",
+            "F3",
+            "F4",
+            "F5"
+          ]
+        },
+        "interval": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "overlap": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "backfill": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "class",
+        "interval",
+        "overlap",
+        "backfill"
+      ]
+    },
+    "endpoints": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "format": "uri",
+        "pattern": "^https://[^/?#@\\s]+(?:/[^?#\\s]*)?$"
+      }
+    },
+    "rate_limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "window_seconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "requests",
+        "window_seconds"
+      ]
+    },
+    "formats": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema_id": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "validate": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "schema_id",
+        "validate"
+      ]
+    },
+    "expectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "freshness_slo": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "freshness_slo"
+      ]
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "baa": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dpa": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "baa",
+        "dpa"
+      ]
+    },
+    "phi": {
+      "type": "boolean"
+    },
+    "owner": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "phase": {
+      "enum": [
+        "dev",
+        "qa",
+        "prod"
+      ]
+    },
+    "shadow": {
+      "type": "boolean"
+    },
+    "raw_retention": {
+      "type": "string",
+      "pattern": "^(forever|[1-9][0-9]{0,2}d|[12][0-9]{3}d|3[0-5][0-9]{2}d|36[0-4][0-9]d|3650d)$"
+    },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{1,62}$"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      }
+    }
+  },
+  "required": [
+    "id",
+    "stream",
+    "mode",
+    "route",
+    "auth",
+    "schedule",
+    "endpoints",
+    "rate_limit",
+    "formats",
+    "expectations",
+    "contract",
+    "phi",
+    "owner",
+    "phase",
+    "shadow",
+    "raw_retention",
+    "schema_version",
+    "adapter"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:nickel:schemas:connector-manifest:1.0",
+  "title": "Nickel connector manifest v1.0",
+  "description": "CN-01 declarative connector contract. Schedule durations and freshness_slo use seconds. References are identifiers, never secret values.",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "phi": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "contract": {
+            "properties": {
+              "baa": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "enum": [
+              "qa",
+              "prod"
+            ]
+          },
+          "auth": {
+            "properties": {
+              "type": {
+                "not": {
+                  "const": "none"
+                }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "auth": {
+            "properties": {
+              "vault_path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "formats": {
+            "properties": {
+              "validate": {
+                "const": true
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "formats": {
+            "properties": {
+              "schema_id": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "\\S"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

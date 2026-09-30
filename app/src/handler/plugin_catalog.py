@@ -27,19 +27,23 @@ def plugin(settings, key):
 def provider(settings, key):
     if key in nango.PROVIDERS:
         return nango.provider(key)
-    definition = plugin(settings, key)
-    return nango.Provider(
-        name=definition["name"],
-        integration=definition["nango_integration"],
-        streams={r["name"]: r["path"] for r in definition["resources"]},
-    )
+    raise BadRequestError("Runtime plugins are on hold pending reviewed manifests")
 
 
 def check_integration(settings, key, integration):
-    if (
-        key not in nango.PROVIDERS
-        and provider(settings, key).integration != integration
-    ):
+    if provider(settings, key).integration != integration:
         raise BadRequestError(
             "Select a connection belonging to this plugin's Nango integration"
         )
+
+
+def allowed_integration(settings, integration):
+    prefix = f"nickel-{str(require_tenant(settings)).replace('-', '')}-"
+    return integration in {
+        p.integration for p in nango.PROVIDERS.values()
+    } or integration.startswith(prefix)
+
+
+def require_integration(settings, integration):
+    if not allowed_integration(settings, integration):
+        raise BadRequestError("Nango integration is not available to this tenant")

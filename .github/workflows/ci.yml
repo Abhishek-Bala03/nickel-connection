@@ -2,7 +2,6 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev, qa, main]
   push:
     branches: [dev, qa, main]
 
@@ -28,6 +27,9 @@ jobs:
 
       - name: Pre-commit (Trivy runs in its own step)
         run: SKIP=trivy-scan uv run pre-commit run --all-files --show-diff-on-failure
+
+      - name: Validate connector manifests and Kafka envelope contract
+        run: PYTHONPATH=app uv run python -m scripts.contracts
 
       - name: Unit tests, coverage >= 95%
         run: uv run pytest

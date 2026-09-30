@@ -58,6 +58,25 @@ class FakeNango:
         if path.startswith("/connections/"):
             key = (request.url.params["provider_config_key"], path.split("/")[2])
             return httpx.Response(200 if key in self.connections else 404)
+        if path == "/connections" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "connections": [
+                        {
+                            "provider_config_key": i,
+                            "connection_id": c,
+                            "tags": {
+                                "end_user_id": "12489275",
+                                "organization_id": request.url.params[
+                                    "endUserOrganizationId"
+                                ],
+                            },
+                        }
+                        for i, c in self.connections
+                    ]
+                },
+            )
         if path == "/connections":
             body = json.loads(request.content)
             assert body["credentials"] == {"type": "NONE"}
@@ -69,6 +88,7 @@ class FakeNango:
 @pytest.fixture
 def fake(monkeypatch):
     fake = FakeNango()
+    fake.connections.add(("nickel-sim-oura", "oura-1"))
     monkeypatch.setattr(
         handler,
         "client",
@@ -242,7 +262,7 @@ def test_connector_refusals(nango_settings, fake):
     with pytest.raises(BadRequestError, match="at least one"):
         new(nango_settings, streams=[])
     # Not simulated: the patient must have connected through Nango first.
-    with pytest.raises(BadRequestError, match="connect the patient"):
+    with pytest.raises(BadRequestError, match="Authorize this patient"):
         new(
             nango_settings,
             provider_key="dexcom",
@@ -313,7 +333,7 @@ def test_a_pull_stores_each_stream_and_serves_it_back(
             json={
                 "name": "Oura - 12489275",
                 "provider": "oura",
-                "nango_connection_id": "oura-12489275",
+                "nango_connection_id": "oura-1",
                 "patient_id": "12489275",
                 "streams": ["daily_sleep", "sleep"],
             },
@@ -399,7 +419,8 @@ def test_a_failed_stream_fails_the_job_content_free(
             json={
                 "name": "Oura",
                 "provider": "oura",
-                "nango_connection_id": "o",
+                "nango_connection_id": "oura-1",
+                "patient_id": "12489275",
                 "streams": ["sleep"],
             },
         ).json()
@@ -431,3 +452,56 @@ def test_a_payload_over_the_viewer_cap_is_not_served(nango_settings, fake, monke
     monkeypatch.setattr(handler, "MAX_VIEW_BYTES", 10)
     with pytest.raises(BadRequestError, match="viewer"):
         handler.read_payload(nango_settings, job.job_id, "daily_sleep")
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_paginated_pull_records_each_page_and_advances_only_after_completion(
+    service, nango_settings, fake, wait_for, monkeypatch, fail_second
+):
+    original = FakeNango.__call__
+    pages = [b'{"data":[1], "next_token":"page-two"}', b'{"data":[2]}']
+    failed = fail_second
+
+    def respond(self, request):
+        if request.url.path.startswith("/proxy/"):
+            assert "start_date" in request.url.params
+            second = request.url.params.get("next_token") == "page-two"
+            return httpx.Response(
+                503 if second and failed else 200, content=pages[int(second)]
+            )
+        return original(self, request)
+
+    monkeypatch.setattr(FakeNango, "__call__", respond)
+    made = new(nango_settings, streams=["sleep"])
+    storage = handler.store(nango_settings)
+    with service(
+        **{
+            f.name: getattr(nango_settings, f.name)
+            for f in dataclasses.fields(nango_settings)
+        }
+    ) as api:
+
+        def run():
+            queued = api.post("/jobs/nango/pull", json={"connector_id": made.id})
+            return wait_for(api, queued.json()["job_id"])
+
+        job = run()
+        if fail_second:
+            assert job["status"] == "failed"
+            assert storage.watermark(made.tenant_id, made.id, "sleep") is None
+            failed = False
+            job = run()
+            assert job["counts"]["duplicates"] == 1
+        assert job["status"] == "succeeded", job
+        assert job["counts"]["records"] == 2
+        stored = api.get(f"/jobs/{job['job_id']}/pulls").json()
+        assert [p["page"] for p in stored] == [1, 2]
+        assert len({p["ingest_id"] for p in stored}) == 2
+        for page, raw in enumerate(pages, 1):
+            assert (
+                api.get(
+                    f"/jobs/{job['job_id']}/pulls/sleep/payload", params={"page": page}
+                ).content
+                == raw
+            )
+        assert storage.watermark(made.tenant_id, made.id, "sleep") is not None

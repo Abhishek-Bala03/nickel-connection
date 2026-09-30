@@ -1,13 +1,17 @@
-"""Dynamic Nango discovery and linking: secrets never leave the backend."""
+"""Review regressions: tenant/provider/patient binding is enforced server-side."""
 
 import json
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from src.connectors.nango import NangoClient
-from src.error import UpstreamError
+from src.db.plugins import PluginStore
+from src.error import BadRequestError, UpstreamError
 from src.handler import nango as handler
+from src.models.connectors import ConnectorCreate, ConnectorUpdate
+from src.models.plugins import PluginCreate, PluginResource
 
 
 def remote(monkeypatch, responder):
@@ -15,249 +19,248 @@ def remote(monkeypatch, responder):
         handler,
         "client",
         lambda settings: NangoClient(
-            "http://nango.test",
-            "private-api-key",
-            transport=httpx.MockTransport(responder),
+            "https://nango.test", "secret", transport=httpx.MockTransport(responder)
         ),
     )
 
 
-def test_discovery_filters_secrets_and_scopes_connect_session(service, monkeypatch):
+def connection(
+    tenant, patient="patient-1", integration="nickel-sim-oura", id="authorized"
+):
+    return {
+        "provider_config_key": integration,
+        "connection_id": id,
+        "tags": {"end_user_id": patient, "organization_id": str(tenant)},
+    }
+
+
+def test_scoped_discovery_session_and_derived_binding(service, settings, monkeypatch):
+    calls = []
+
     def respond(req):
-        assert req.headers["Authorization"] == "Bearer private-api-key"
+        calls.append(req)
         if req.url.path == "/integrations":
             return httpx.Response(
                 200,
                 json={
                     "data": [
-                        {
-                            "unique_key": "oura-mock",
-                            "provider": "oura",
-                            "client_secret": "private",
-                        }
+                        {"unique_key": i} for i in ["nickel-sim-oura", "another-tenant"]
                     ]
                 },
             )
         if req.url.path == "/connections":
-            assert req.url.params["page"] == "0"
+            assert req.url.params["endUserId"] == "patient-1"
+            assert req.url.params["endUserOrganizationId"] == str(settings.tenant_id)
             return httpx.Response(
                 200,
                 json={
                     "connections": [
-                        {
-                            "connection_id": "ours",
-                            "provider_config_key": "oura-mock",
-                            "credentials": {"token": "private"},
-                        },
-                        {
-                            "connection_id": "other",
-                            "provider_config_key": "dexcom-mock",
-                        },
+                        connection(settings.tenant_id),
+                        connection(settings.tenant_id, patient="wrong"),
+                        connection("wrong-tenant"),
+                        connection(settings.tenant_id, integration="wrong-integration"),
                     ]
                 },
             )
         assert req.url.path == "/connect/sessions"
         assert json.loads(req.content) == {
-            "allowed_integrations": ["oura-mock"],
+            "allowed_integrations": ["nickel-sim-oura"],
             "end_user": {"id": "patient-1"},
+            "organization": {"id": str(settings.tenant_id)},
         }
         return httpx.Response(
-            201,
-            json={
-                "data": {
-                    "connect_link": "https://connect.test/?session_token=temporary",
-                    "token": "temporary",
-                }
-            },
+            201, json={"data": {"connect_link": "https://connect.test/session"}}
         )
 
     remote(monkeypatch, respond)
+    body = {
+        "name": "Ring",
+        "provider": "oura",
+        "patient_id": "patient-1",
+        "streams": ["sleep"],
+    }
     with service() as api:
-        assert api.get("/nango/integrations").json() == [
-            {"id": "oura-mock", "name": "oura-mock", "provider": "oura"}
+        assert [i["id"] for i in api.get("/nango/integrations").json()] == [
+            "nickel-sim-oura"
         ]
-        assert api.get("/nango/connections?integration=oura-mock").json() == {
-            "connections": [{"id": "ours", "integration": "oura-mock"}],
-            "next_page": None,
-        }
-        response = api.post(
-            "/nango/connect-session",
-            json={"integration": "oura-mock", "end_user_id": "patient-1"},
+        assert (
+            api.get("/connectors/catalog").json()[0]["nango_integration"]
+            == "nickel-sim-oura"
         )
-        assert response.status_code == 201
-        assert response.headers["cache-control"] == "no-store"
-        assert set(response.json()) == {"connect_link"}
+        found = api.get(
+            "/nango/connections",
+            params={"integration": "nickel-sim-oura", "patient_id": "patient-1"},
+        )
+        assert found.json()["connections"] == [
+            {"id": "authorized", "integration": "nickel-sim-oura"}
+        ]
         assert (
             api.post(
                 "/nango/connect-session",
-                json={"integration": "missing", "end_user_id": "patient-1"},
+                json={"integration": "nickel-sim-oura", "patient_id": "patient-1"},
+            ).status_code
+            == 201
+        )
+        for bad in [
+            {"nango_integration": "other"},
+            {"nango_connection_id": "typed-wrong-id"},
+        ]:
+            assert api.post("/connectors", json={**body, **bad}).status_code == 400
+        created = api.post("/connectors", json=body)
+        assert created.status_code == 201, created.text
+        assert created.json()["nango_connection_id"] == "authorized"
+        count = len(calls)
+        assert (
+            api.post(
+                "/nango/connect-session",
+                json={"integration": "another-tenant", "patient_id": "patient-1"},
             ).status_code
             == 400
         )
-        assert api.get("/nango/connections?integration=../bad").status_code == 422
         assert (
             api.get(
-                "/nango/integrations", headers={"Authorization": "Bearer wrong"}
+                "/nango/connections",
+                params={"integration": "another-tenant", "patient_id": "patient-1"},
             ).status_code
-            == 401
+            == 400
+        )
+        assert len(calls) == count
+        assert (
+            api.put(
+                f"/connectors/{created.json()['id']}",
+                json={
+                    "name": "Ring",
+                    "provider": "dexcom",
+                    "streams": ["egvs"],
+                    "version": 1,
+                },
+            ).status_code
+            == 422
         )
 
 
-def test_explicit_remote_integration_is_persisted_and_never_provisioned(
-    service, monkeypatch
-):
-    calls = []
-
-    def respond(req):
-        calls.append(req)
-        assert req.method == "GET"
-        if req.url.path == "/connections/remote-oura":
-            assert req.url.params["provider_config_key"] == "oura-mock"
-            return httpx.Response(200, json={})
-        assert req.headers["Provider-Config-Key"] == "oura-mock"
-        assert "Base-Url-Override" not in req.headers
-        return httpx.Response(200, json={"data": [1]})
-
-    remote(monkeypatch, respond)
-    with service(nango_base_url_overrides={"oura": "http://vendor-sim:8080"}) as api:
-        response = api.post(
-            "/connectors",
-            json={
-                "name": "Remote",
-                "provider": "oura",
-                "nango_integration": "oura-mock",
-                "nango_connection_id": "remote-oura",
-                "streams": ["sleep"],
-            },
-        )
-        assert response.status_code == 201, response.text
-        saved = response.json()
-        assert saved["nango_integration"] == "oura-mock"
-        assert api.post(f"/connectors/{saved['id']}/test").json()["ok"]
-    assert len(calls) == 2
-
-
-@pytest.mark.parametrize("status", [401, 403, 500])
-def test_auth_errors_are_not_misreported_as_missing_connection(status):
+@pytest.mark.parametrize(
+    "items",
+    [
+        [],
+        [{}],
+        [{"provider_config_key": "nickel-sim-oura", "connection_id": "unbound"}],
+    ],
+)
+def test_unbound_connections_are_not_accepted(items):
     client = NangoClient(
-        "http://nango.test",
-        "private",
+        "https://n.test",
+        "s",
         transport=httpx.MockTransport(
-            lambda req: httpx.Response(status, json={"secret": "do-not-return"})
+            lambda _: httpx.Response(200, json={"connections": items})
         ),
     )
-    with pytest.raises(UpstreamError, match=str(status)) as error:
-        client.has_connection("oura-mock", "id")
-    assert "do-not-return" not in str(error.value)
+    assert client.patient_connection("nickel-sim-oura", "p", "t") is None
     client.close()
 
 
-def test_connection_pagination_and_integration_filter():
+def test_multiple_accounts_fail_closed():
     client = NangoClient(
-        "http://nango.test",
-        "private",
+        "https://n.test",
+        "s",
         transport=httpx.MockTransport(
-            lambda req: httpx.Response(
+            lambda _: httpx.Response(
                 200,
                 json={
-                    "connections": [
-                        {"provider_config_key": "other", "connection_id": str(i)}
-                        for i in range(100)
-                    ]
+                    "connections": [connection("t", id="a"), connection("t", id="b")]
                 },
             )
         ),
     )
-    assert client.connections("oura-mock", 2) == {"connections": [], "next_page": 3}
+    with pytest.raises(BadRequestError, match="Multiple"):
+        client.patient_connection("nickel-sim-oura", "patient-1", "t")
     client.close()
 
 
 @pytest.mark.parametrize(
-    "payload",
+    "link",
     [
-        {"data": {"connect_link": "javascript:alert(1)"}},
-        {"data": {"token": "old-server"}},
+        "http://connect.test",
+        "javascript:alert(1)",
+        "https://user:pass@connect.test",
+        None,
     ],
 )
-def test_invalid_or_missing_connect_link_is_actionable(payload):
+def test_connect_link_requires_https(link):
     def respond(req):
         return httpx.Response(
             200,
             json=(
-                {"data": [{"unique_key": "oura-mock"}]}
-                if req.method == "GET"
-                else payload
+                {"data": [{"unique_key": "i"}]}
+                if req.url.path == "/integrations"
+                else {"data": {"connect_link": link}}
             ),
         )
 
-    client = NangoClient(
-        "http://nango.test", "private", transport=httpx.MockTransport(respond)
-    )
-    with pytest.raises(UpstreamError, match="Configure Connect UI"):
-        client.connect_session("oura-mock", "patient")
+    client = NangoClient("https://n.test", "s", transport=httpx.MockTransport(respond))
+    with pytest.raises(UpstreamError):
+        client.connect_session("i", "p", "t")
+    if link == "http://connect.test":
+        assert (
+            client.connect_session("i", "p", "t", allow_http=True)["connect_link"]
+            == link
+        )
     client.close()
 
 
-def test_provider_correction_preserves_connection_and_persists(service, monkeypatch):
-    remote(monkeypatch, lambda req: httpx.Response(200, json={}))
-    with service() as api:
-        original = api.post(
-            "/connectors",
-            json={
-                "name": "Oura correction",
-                "provider": "dexcom",
-                "nango_integration": "oura-mock",
-                "nango_connection_id": "existing",
-                "patient_id": "patient-1",
-                "streams": ["egvs"],
-            },
-        ).json()
-        path = f"/connectors/{original['id']}"
-        body = {
-            "name": original["name"],
-            "description": "",
-            "provider": "oura",
-            "streams": ["daily_sleep", "sleep"],
-            "enabled": True,
-            "version": original["version"],
-        }
-        invalid = api.put(path, json={**body, "streams": ["egvs"]})
-        assert invalid.status_code == 400
-        assert api.get(path).json() == original
-        response = api.put(path, json=body)
-        assert response.status_code == 200, response.text
-        saved = api.get(path).json()
-        assert saved["provider"] == "oura"
-        assert saved["streams"] == ["daily_sleep", "sleep"]
-        for key in ["id", "nango_integration", "nango_connection_id", "patient_id"]:
-            assert saved[key] == original[key]
-        assert saved["version"] == original["version"] + 1
-        assert api.put(path, json=body).status_code == 409
-
-
-def test_failed_provider_correction_does_not_modify_connector(service, monkeypatch):
-    remote(monkeypatch, lambda req: httpx.Response(200, json={}))
-    with service() as api:
-        original = api.post(
-            "/connectors",
-            json={
-                "name": "Missing connection",
-                "provider": "dexcom",
-                "nango_integration": "oura-mock",
-                "nango_connection_id": "existing",
-                "streams": ["egvs"],
-            },
-        ).json()
-        remote(monkeypatch, lambda req: httpx.Response(404))
-        path = f"/connectors/{original['id']}"
-        response = api.put(
-            path,
-            json={
-                "name": original["name"],
-                "provider": "oura",
-                "streams": ["sleep"],
-                "version": original["version"],
-            },
+def test_models_refuse_missing_patient_provider_edits_and_url_overrides():
+    with pytest.raises(ValidationError):
+        ConnectorCreate(name="Ring", provider="oura", streams=["sleep"])
+    with pytest.raises(ValidationError):
+        ConnectorUpdate(name="Ring", streams=["sleep"], version=1, provider="dexcom")
+    for url in ["https://127.0.0.1.nip.io", "https://vendor.test"]:
+        with pytest.raises(ValidationError):
+            PluginCreate(
+                id="clinic",
+                name="Clinic",
+                nango_provider="epic",
+                resources=[{"name": "r", "path": "/Patient"}],
+                base_url=url,
+            )
+    with pytest.raises(ValidationError):
+        PluginResource(
+            name="r", path="/Patient", method="POST", body={"resourceType": "Patient"}
         )
-        assert response.status_code == 400
-        assert api.get(path).json() == original
+    assert PluginResource(name="r", path="/Patient/_search", method="POST")
+
+
+def test_preexisting_runtime_plugin_is_not_executable(service, settings, monkeypatch):
+    PluginStore(settings.data_dir / "connectors.sqlite").add(
+        str(settings.tenant_id),
+        {
+            "id": "clinic",
+            "name": "Clinic",
+            "status": "ready",
+            "nango_integration": "old",
+            "resources": [{"name": "r", "path": "/Patient"}],
+        },
+    )
+    monkeypatch.setattr(
+        handler, "client", lambda _: pytest.fail("must not reach Nango")
+    )
+    with service() as api:
+        assert all(p["id"] != "clinic" for p in api.get("/connectors/catalog").json())
+        assert (
+            api.post(
+                "/connectors",
+                json={
+                    "name": "Clinic",
+                    "provider": "clinic",
+                    "patient_id": "p",
+                    "streams": ["r"],
+                },
+            ).status_code
+            == 400
+        )
+        assert (
+            api.post(
+                "/plugins/clinic/provision",
+                json={"client_id": "id", "client_secret": "secret"},
+            ).status_code
+            == 400
+        )

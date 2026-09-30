@@ -1,3 +1,33 @@
+> PR review update (30 September 2026): runtime plugin creation and provisioning are
+> disabled pending the reviewed-manifest/SDK decision. Existing plugin records are retained,
+> but omitted from the catalog and refused by create, test and pull. The plugin workflow
+> described below is historical design context, not an enabled feature.
+>
+> Available built-ins enforce their exact configured integration. A patient ID is required;
+> Connect sessions set `end_user.id` from that patient and `organization.id` from the server's
+> tenant. Discovery filters by those identities, rechecks returned ownership, and refuses
+> ambiguous accounts. Unbound legacy accounts must be reauthorized; no automatic reassignment.
+> Provider, patient and connection are immutable after creation. User base URL overrides
+> and arbitrary POSTs are refused; only `/_search` POSTs remain in the held SDK helper.
+>
+> Successful built-in pulls persist per-tenant/connector/stream UTC watermarks. The initial
+> window is one day, with a one-day Oura overlap and five-minute Dexcom EGVS overlap.
+> Oura pagination is consumed one page at a time, each with its own raw receipt, hash and
+> payload viewer entry. The watermark advances only after the whole stream succeeds.
+> Metadata endpoints have no date filter. Failed/rejected streams do not advance. GETs retry
+> 429 twice, respecting Retry-After up to 30 seconds; longer waits fail for a later retry.
+> This does not implement a FHIR incremental adapter: that remains part of the held SDK work.
+> The reusable resource helper now yields original pages separately without a synthetic wrapper;
+> it is not connected to runtime plugins. HAPI base-path next links (`/fhir?_getpages=...`)
+> remain unsupported and fail explicitly. SDK integration must ingest each yielded page before
+> requesting the next, with its own receipt and hash.
+>
+> Provisioning (including rotation of live integrations) cannot run, so no OAuth secret can
+> be patched through these routes. An actor audit and explicit rotation flow are prerequisites
+> if reviewed plugin provisioning is restored.
+>
+> CI now runs for all PR bases. Retarget to dev only after the dependent base branches land.
+
 # Healthcare API plugins and account connections
 
 The Plugins drawer now saves resource definitions, creates/configures a Nango integration,

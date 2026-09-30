@@ -115,3 +115,5 @@ cd app && uv run --env-file ../.env python -m src.cli documents status   # the c
 
 See [scheduler deployment and API behavior](docs/scheduler.md) for the authenticated
 configuration UI, APScheduler process and the connection jobs API adapter.
+
+- [Connector contracts (CN-01)](docs/connector-contracts.md): manifest editor, draft validation, Kafka envelope schema, CI gate and registry registration.

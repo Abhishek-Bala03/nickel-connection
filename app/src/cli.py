@@ -23,6 +23,7 @@ from typing import TextIO
 from src.config import ServiceSettings, load_settings
 from src.connectors.documents import DocumentManifest, ManifestError
 from src.connectors.documents.sources import FetchError
+from src.contracts import schema as contract_schema
 from src.db.file_store import FileStoreError
 from src.error import UnavailableError
 from src.handler import documents
@@ -99,7 +100,14 @@ def _status(args: argparse.Namespace, settings: ServiceSettings, out: TextIO) ->
 
 
 def _schema(args: argparse.Namespace, out: TextIO) -> int:
-    text = json.dumps(SCHEMAS[args.name].model_json_schema(), indent=2)
+    text = json.dumps(
+        (
+            contract_schema(args.name.removeprefix("contract-"))
+            if args.name.startswith("contract-")
+            else SCHEMAS[args.name].model_json_schema()
+        ),
+        indent=2,
+    )
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
     else:
@@ -158,7 +166,9 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--recent", type=int, default=10)
 
     schema = commands.add_parser("schema", help="print the JSON Schema of a contract")
-    schema.add_argument("name", choices=sorted(SCHEMAS))
+    schema.add_argument(
+        "name", choices=sorted([*SCHEMAS, "contract-manifest", "contract-envelope"])
+    )
     schema.add_argument("--out", type=Path, default=None)
     return parser
 

@@ -1,0 +1,57 @@
+{
+  "envelope_version": "0.3",
+  "ingest_id": "0199a000-0000-7000-8000-000000000002",
+  "tenant_id": "11111111-1111-4111-8111-111111111111",
+  "member_id": null,
+  "source": "demo-oura-connection",
+  "fetch": "nango",
+  "route": "L7",
+  "mode": "pull",
+  "connector": "nango",
+  "connector_version": "0.1.0",
+  "connection_id": "demo-oura-connection",
+  "source_patient_id": "12489275",
+  "device_id": null,
+  "message_id": "demo-oura-connection/daily_sleep",
+  "idempotency_key": "b31440a600c1c079d3c56cab20b02d83cd4c2ec79cad2d36461b85804540fb67",
+  "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "attempt": 1,
+  "content_type": "application/json",
+  "fhir_release": null,
+  "received_at": "2026-09-30T00:00:00Z",
+  "event_time": null,
+  "retention_class": "stream",
+  "schema_id": null,
+  "consent_ref": null,
+  "quality": {
+    "flags": []
+  },
+  "payload_hash": "d29324922200d294febe60622f40cfa1224718dfe37834472cb0bd55a54e1a7e",
+  "payload_bytes": 270,
+  "payload_ref": null,
+  "payload": {
+    "data": [
+      {
+        "id": "d948a134-d69b-4577-9b86-500602c58572",
+        "contributors": {
+          "deep_sleep": 68,
+          "efficiency": 92,
+          "latency": 27,
+          "rem_sleep": 100,
+          "restfulness": 73,
+          "timing": 89,
+          "total_sleep": 100
+        },
+        "day": "2024-08-03",
+        "score": 77,
+        "timestamp": "2024-08-04T10:06:20-07:00"
+      }
+    ],
+    "next_token": null
+  },
+  "source_meta": {
+    "provider": "oura",
+    "stream": "daily_sleep",
+    "page": 1
+  }
+}

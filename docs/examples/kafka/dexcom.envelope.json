@@ -1,0 +1,58 @@
+{
+  "envelope_version": "0.3",
+  "ingest_id": "0199a000-0000-7000-8000-000000000001",
+  "tenant_id": "11111111-1111-4111-8111-111111111111",
+  "member_id": null,
+  "source": "demo-dexcom-connection",
+  "fetch": "nango",
+  "route": "L7",
+  "mode": "pull",
+  "connector": "nango",
+  "connector_version": "0.1.0",
+  "connection_id": "demo-dexcom-connection",
+  "source_patient_id": "32021994",
+  "device_id": null,
+  "message_id": "demo-dexcom-connection/egvs",
+  "idempotency_key": "4e0456985012ac53fbfcc07a29bf8798cd5a4a0c60541e6a23a6ffc2c38fd586",
+  "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "attempt": 1,
+  "content_type": "application/json",
+  "fhir_release": null,
+  "received_at": "2026-09-30T00:00:00Z",
+  "event_time": null,
+  "retention_class": "stream",
+  "schema_id": null,
+  "consent_ref": null,
+  "quality": {
+    "flags": []
+  },
+  "payload_hash": "8dc0ab7e8b81454764eb9a1393bafb716b641c8ef3e38bfa79529eed5394c0a4",
+  "payload_bytes": 391,
+  "payload_ref": null,
+  "payload": {
+    "recordType": "egv",
+    "recordVersion": "3.0",
+    "userId": "u-32021994",
+    "records": [
+      {
+        "recordId": "1aab5d85-ea65-4a70-941e-f368a39e2ba6",
+        "systemTime": "2026-01-09T04:30:00",
+        "displayTime": "2026-01-08T21:30:00",
+        "transmitterId": "8296C6",
+        "transmitterTicks": 7853500,
+        "value": 132,
+        "trend": "doubleDown",
+        "trendRate": -3.4,
+        "unit": "mg/dL",
+        "rateUnit": "mg/dL/min",
+        "displayDevice": "iOS",
+        "transmitterGeneration": "g6"
+      }
+    ]
+  },
+  "source_meta": {
+    "provider": "dexcom",
+    "stream": "egvs",
+    "page": 1
+  }
+}

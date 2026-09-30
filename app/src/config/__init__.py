@@ -117,6 +117,7 @@ class ServiceSettings:
     # (Base-Url-Override), e.g. the vendor simulator. Never taken from a connector row: a free-text
     # base URL would be an SSRF path through Nango.
     nango_base_url_overrides: Mapping[str, str] = field(default_factory=dict)
+    kafka_bootstrap_servers: str = ""
 
 
 def _nango_overrides(raw: str, environment: str) -> dict[str, str]:
@@ -321,6 +322,9 @@ def load_settings(
             "NICKEL_FILE_STORE=local is for development and qa: production keeps the originals "
             "in the S3 File Store"
         )
+    kafka = get("KAFKA", "bootstrap_servers")
+    if kafka and environment != "development":
+        raise ValueError("The local plaintext Kafka demo is only supported in development")
     return ServiceSettings(
         name=get("SERVICE", "name", "nickel-connection"),
         environment=environment,
@@ -339,6 +343,7 @@ def load_settings(
         ),
         manifest_dir=Path(get("CONNECTOR", "manifest_dir") or MANIFEST_DIR),
         data_dir=Path(get("STORAGE", "data_dir", ".data")),
+        kafka_bootstrap_servers=kafka,
         max_queued_jobs=_positive_int(
             "jobs max_queued", get("JOBS", "max_queued"), 100
         ),

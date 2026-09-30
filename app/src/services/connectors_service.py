@@ -58,18 +58,9 @@ def provider_catalog(settings: Settings) -> list[ProviderInfo]:
             name=spec.name,
             streams=list(spec.streams),
             simulated=key in settings.nango_base_url_overrides,
+            nango_integration=spec.integration,
         )
         for key, spec in catalog.PROVIDERS.items()
-    ] + [
-        ProviderInfo(
-            id=p["id"],
-            name=p["name"],
-            streams=[r["name"] for r in p["resources"]],
-            simulated=False,
-            nango_integration=p["nango_integration"],
-        )
-        for p in plugin_catalog.definitions(settings)
-        if p["status"] == "ready"
     ]
 
 
@@ -113,7 +104,11 @@ def nango_providers(settings: Settings) -> list[dict]:
 def nango_integrations(settings: Settings) -> list[dict]:
     remote = nango.client(settings)
     try:
-        return remote.integrations()
+        return [
+            i
+            for i in remote.integrations()
+            if plugin_catalog.allowed_integration(settings, i["id"])
+        ]
     finally:
         remote.close()
 
@@ -124,11 +119,23 @@ def nango_connections(
     integration: Annotated[
         str, Query(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$")
     ],
+    patient_id: Annotated[
+        str, Query(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    ],
     page: Annotated[int, Query(ge=0, le=10000)] = 0,
 ) -> dict:
+    plugin_catalog.require_integration(settings, integration)
     remote = nango.client(settings)
     try:
-        return remote.connections(integration, page)
+        connection = remote.patient_connection(
+            integration, patient_id, str(nango.require_tenant(settings))
+        )
+        return {
+            "connections": (
+                [{"id": connection, "integration": integration}] if connection else []
+            ),
+            "next_page": None,
+        }
     finally:
         remote.close()
 
@@ -137,10 +144,16 @@ def nango_connections(
 def nango_connect_session(
     body: ConnectSessionRequest, settings: Settings, response: Response
 ) -> dict:
+    plugin_catalog.require_integration(settings, body.integration)
     remote = nango.client(settings)
     response.headers["Cache-Control"] = "no-store"
     try:
-        return remote.connect_session(body.integration, body.end_user_id)
+        return remote.connect_session(
+            body.integration,
+            body.patient_id,
+            str(nango.require_tenant(settings)),
+            allow_http=settings.environment == "development",
+        )
     finally:
         remote.close()
 
@@ -157,14 +170,13 @@ def update_connector(
     settings: Settings,
     actor: Actor = None,
 ) -> ConnectorResponse:
-    """Edit provider and display fields; preserve the Nango reference and check version."""
+    """Edit display fields; preserve provider, patient and Nango reference."""
     return ConnectorResponse.of(
         nango.update_connector(
             settings,
             connector_id,
             name=body.name,
             description=body.description,
-            provider_key=body.provider,
             streams=body.streams,
             enabled=body.enabled,
             version=body.version,
@@ -202,6 +214,7 @@ def job_pulls(job_id: JobId, settings: Settings) -> list[PullResponse]:
     return [
         PullResponse(
             stream=p.stream,
+            page=p.page,
             outcome=p.outcome,
             ingest_id=p.ingest_id,
             bytes=p.bytes,
@@ -214,10 +227,15 @@ def job_pulls(job_id: JobId, settings: Settings) -> list[PullResponse]:
 
 
 @connectors_router.get("/jobs/{job_id}/pulls/{stream}/payload")
-def pull_payload(job_id: JobId, stream: Stream, settings: Settings) -> Response:
+def pull_payload(
+    job_id: JobId,
+    stream: Stream,
+    settings: Settings,
+    page: Annotated[int, Query(ge=1, le=200)] = 1,
+) -> Response:
     """The stored original of one stream of a pull, as the vendor sent it."""
     return Response(
-        nango.read_payload(settings, job_id, stream),
+        nango.read_payload(settings, job_id, stream, page),
         media_type="application/json",
         headers={"Content-Disposition": f'inline; filename="{stream}.json"'},
     )

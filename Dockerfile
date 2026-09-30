@@ -1,4 +1,4 @@
-# Only app/ goes into the image; the Dockerfile, docs and tests stay outside it (team standard).
+# app/ and the reviewed contract artifacts go into the image; docs and tests stay outside it.
 #   docker build --build-arg APP_VERSION="$(git describe --tags --always)" -t nickel-connection .
 # The base image is python:3.11-slim, pinned by the digest of its multi-arch index on 2026-09-23, so a
 # build gets the bytes that were reviewed, not whatever the tag points at that day (digest only, not
@@ -52,6 +52,8 @@ ENV APP_VERSION=${APP_VERSION}
 # Owned by root (the runtime user can read, not write), so the service cannot rewrite its own code.
 # app/ holds the code, conf/application.conf and manifests/documents/*.yaml.
 COPY app/ .
+COPY schemas/ ./contracts/schemas/
+COPY connectors/ ./contracts/examples/
 
 USER 999
 EXPOSE 8000

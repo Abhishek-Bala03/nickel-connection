@@ -1,6 +1,5 @@
 """Plugin definitions contain request configuration, never account credentials."""
 
-import ipaddress
 import json
 from typing import Literal
 from urllib.parse import unquote, urlsplit
@@ -69,6 +68,8 @@ class PluginResource(BaseModel):
     def request_shape(self) -> "PluginResource":
         if self.method == "GET" and self.body is not None:
             raise ValueError("GET resources cannot have a request body")
+        if self.method == "POST" and not self.path.endswith("/_search"):
+            raise ValueError("POST is allowed only for /_search endpoints")
         if self.method == "POST" and self.pagination.mode != "none":
             raise ValueError("Automatic pagination is supported for GET resources only")
         if len(json.dumps({"query": self.query, "body": self.body})) > 32000:
@@ -83,44 +84,6 @@ class PluginCreate(BaseModel):
     nango_provider: str = Field(
         min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._-]+$"
     )
-    base_url: str | None = Field(default=None, max_length=1000)
-
-    @field_validator("base_url")
-    @classmethod
-    def public_base_url(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        parsed = urlsplit(value)
-        host = (parsed.hostname or "").rstrip(".")
-        if parsed.port is not None and not 1 <= parsed.port <= 65535:
-            raise ValueError("Invalid API port")
-        if (
-            parsed.scheme != "https"
-            or not host
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-            or "${" in value
-            or any(ord(c) <= 32 for c in value)
-            or "\\" in value
-            or host == "localhost"
-            or host.endswith((".localhost", ".local", ".internal"))
-        ):
-            raise ValueError(
-                "Use a public HTTPS base URL without credentials, query or fragment"
-            )
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError:
-            if "." not in host:
-                raise ValueError("Use a public API hostname") from None
-        else:
-            if not address.is_global:
-                raise ValueError("Private API addresses are not supported")
-        resource_path(parsed.path or "/")
-        return value.rstrip("/")
-
     resources: list[PluginResource] = Field(min_length=1, max_length=20)
 
     @model_validator(mode="after")

@@ -21,6 +21,13 @@ from src.db.sqlite import connect
 SOURCES = ("nango", "nickel_internal")
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS stream_cursors (
+    tenant_id TEXT NOT NULL,
+    connector_id TEXT NOT NULL,
+    stream TEXT NOT NULL,
+    watermark TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, connector_id, stream)
+);
 CREATE TABLE IF NOT EXISTS connectors (
     id                  TEXT PRIMARY KEY,
     tenant_id           TEXT NOT NULL,
@@ -52,6 +59,20 @@ CREATE TABLE IF NOT EXISTS pulls (
     records     INTEGER NOT NULL CHECK (records >= 0),
     fetched_at  TEXT NOT NULL,
     PRIMARY KEY (job_id, stream)
+);
+CREATE TABLE IF NOT EXISTS pull_pages (
+    job_id      TEXT NOT NULL,
+    tenant_id   TEXT NOT NULL,
+    connector_id TEXT NOT NULL REFERENCES connectors (id),
+    stream      TEXT NOT NULL,
+    page        INTEGER NOT NULL CHECK (page >= 1),
+    outcome     TEXT NOT NULL,
+    ingest_id   TEXT NOT NULL,
+    payload_ref TEXT,
+    bytes       INTEGER NOT NULL CHECK (bytes >= 0),
+    records     INTEGER NOT NULL CHECK (records >= 0),
+    fetched_at  TEXT NOT NULL,
+    PRIMARY KEY (job_id, stream, page)
 );
 """
 _SELECT = (
@@ -101,6 +122,7 @@ class Pull:
     records: int
     fetched_at: str
     tenant_id: str = field(default="", repr=False)
+    page: int = 1
 
 
 def _connector(row: tuple) -> Connector:
@@ -207,9 +229,9 @@ class ConnectorStore:
     def record_pull(self, pull: Pull) -> None:
         with self._db() as db:
             db.execute(
-                "INSERT OR REPLACE INTO pulls (job_id, tenant_id, connector_id, stream, outcome, "
-                "ingest_id, payload_ref, bytes, records, fetched_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO pull_pages (job_id, tenant_id, connector_id, stream, outcome, "
+                "ingest_id, payload_ref, bytes, records, fetched_at, page) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     pull.job_id,
                     pull.tenant_id,
@@ -221,6 +243,7 @@ class ConnectorStore:
                     pull.bytes,
                     pull.records,
                     pull.fetched_at,
+                    pull.page,
                 ),
             )
 
@@ -228,8 +251,27 @@ class ConnectorStore:
         with self._db() as db:
             rows = db.execute(
                 "SELECT job_id, connector_id, stream, outcome, ingest_id, payload_ref, bytes, "
-                "records, fetched_at, tenant_id FROM pulls WHERE tenant_id = ? AND job_id = ? "
-                "ORDER BY fetched_at",
-                (tenant_id, job_id),
+                "records, fetched_at, tenant_id, page FROM pull_pages WHERE tenant_id = ? AND job_id = ? "
+                "UNION ALL SELECT job_id, connector_id, stream, outcome, ingest_id, payload_ref, bytes, "
+                "records, fetched_at, tenant_id, 1 FROM pulls WHERE tenant_id = ? AND job_id = ? "
+                "ORDER BY fetched_at, page",
+                (tenant_id, job_id, tenant_id, job_id),
             ).fetchall()
         return [Pull(*row) for row in rows]
+
+    def watermark(self, tenant_id: str, connector_id: str, stream: str) -> str | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT watermark FROM stream_cursors WHERE tenant_id=? AND connector_id=? AND stream=?",
+                (tenant_id, connector_id, stream),
+            ).fetchone()
+        return row[0] if row else None
+
+    def advance(
+        self, tenant_id: str, connector_id: str, stream: str, watermark: str
+    ) -> None:
+        with self._db() as db:
+            db.execute(
+                "INSERT INTO stream_cursors VALUES (?, ?, ?, ?) ON CONFLICT(tenant_id, connector_id, stream) DO UPDATE SET watermark=MAX(stream_cursors.watermark, excluded.watermark)",
+                (tenant_id, connector_id, stream, watermark),
+            )

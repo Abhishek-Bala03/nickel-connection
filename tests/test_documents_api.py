@@ -111,6 +111,10 @@ def test_the_api_is_the_connection_layer_and_nothing_more(client):
         ("GET", "/documents"),
         # Nango connectors (docs/demo-nango-wearables.md): references to Nango connections, their
         # pull, and what a pull stored.
+        ("GET", "/contracts"),
+        ("GET", "/plugin-manifests"),
+        ("POST", "/plugin-manifests"),
+        ("POST", "/plugin-manifests/validate"),
         ("GET", "/plugins"),
         ("POST", "/plugins"),
         ("POST", "/plugins/{plugin_id}/provision"),

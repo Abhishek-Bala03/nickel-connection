@@ -3,8 +3,6 @@
 import json
 from urllib.parse import parse_qsl, urlsplit
 
-import httpx
-
 from src.error import UpstreamError
 from src.models.plugins import PluginResource
 
@@ -25,7 +23,6 @@ def fetch_resource(
     resource: PluginResource,
     *,
     max_bytes,
-    base_url=None,
 ):
     limit = min(max_bytes, 20 * 1024 * 1024)
     query = dict(resource.query)
@@ -33,24 +30,21 @@ def fetch_resource(
     if paging.mode == "offset":
         query[paging.limit_param] = str(paging.page_size)
         query[paging.offset_param] = "0"
-    pages = []
     seen = set()
-    total = 0
     for page in range(paging.max_pages):
         signature = json.dumps(query, sort_keys=True)
         if signature in seen:
             raise UpstreamError("The API repeated a pagination cursor")
         seen.add(signature)
+        total = 0
         chunks = []
         headers = {
             "Connection-Id": connection_id,
             "Provider-Config-Key": integration,
             "Accept": "application/json",
         }
-        if base_url:
-            headers["Base-Url-Override"] = base_url
         try:
-            with client._http.stream(
+            with client.stream(
                 resource.method,
                 f"/proxy{resource.path}",
                 params=query,
@@ -68,16 +62,16 @@ def fetch_resource(
                             "The API response exceeded the configured size limit"
                         )
                     chunks.append(chunk)
-        except httpx.HTTPError:
+        except UpstreamError:
             raise UpstreamError(
                 "Nango could not complete the resource request"
             ) from None
-        raw = b"".join(chunks) or b"[]"
+        raw = b"".join(chunks)
         try:
             data = json.loads(raw)
         except (ValueError, UnicodeError):
             raise UpstreamError("The API did not return valid JSON") from None
-        pages.append(raw)
+        yield raw
         if paging.mode == "none":
             break
         if paging.mode == "fhir":
@@ -127,5 +121,3 @@ def fetch_resource(
         raise UpstreamError(
             "Pagination exceeded max_pages; increase the limit or narrow the query"
         )
-    # Preserve each page's JSON bytes. The wrapper makes all pages viewable as one stream payload.
-    return pages[0] if len(pages) == 1 else b'{"pages":[' + b",".join(pages) + b"]}"
